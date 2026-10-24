@@ -64,6 +64,7 @@ func newRootCommand() *cobra.Command {
 	klog.InitFlags(klogFlagSet)
 	rootCmd.PersistentFlags().AddGoFlagSet(klogFlagSet)
 
+	rootCmd.AddCommand(newServeCommand())
 	rootCmd.AddCommand(newSessionCommand())
 	return rootCmd
 }
@@ -75,6 +76,9 @@ func newSessionCommand() *cobra.Command {
 	}
 
 	sessionCmd.AddCommand(newSessionRunCommand())
+	sessionCmd.AddCommand(newSessionListCommand())
+	sessionCmd.AddCommand(newSessionGetCommand())
+	sessionCmd.AddCommand(newSessionSendCommand())
 	return sessionCmd
 }
 
@@ -313,3 +317,5 @@ func (e *consoleEvents) ApproveToolCall(_ context.Context, call llm.ToolCall) (b
 func (e *consoleEvents) ToolCallStarted(_ context.Context, _ llm.ToolCall) {}
 
 func (e *consoleEvents) ToolCallFinished(_ context.Context, _ llm.ToolCall, _ error) {}
+
+func (e *consoleEvents) MessageAppended(_ context.Context, _ llm.Message) {}

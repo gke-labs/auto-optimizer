@@ -101,6 +101,7 @@ token-only first cut, so a token and an App both work from day one.
 | `pkg/forge` | adapted from eval-runner `pkg/forge` | Defines the `Forge` interface for repositories, branches, change requests, and commits, and the `Reporter` interface for comments and statuses. We add a `ChangeRequestCreator` interface for opening PRs. Implementations are `github`, which authenticates with a token or an App installation token, `gitremote`, which lists refs in pure Go without credentials, and `fake`. The `syncer` polls and emits events. The `store` is a rebuildable local cache. |
 | `pkg/goals` | new | Finds `.goals/*.md` at the head of the default branch, parses the front matter, validates it, and computes a content hash so that an unchanged goal is not re-run needlessly. |
 | `pkg/session` | forked from agent-sandbox `examples/sandboxed-tools/pkg/{agent,sessions}` | Runs the agentic loop. It holds the messages, dispatches tool calls, asks approval hooks, persists the transcript, and extends the sandbox lifetime. We changed it to talk to sandboxd and to use a workspace volume instead of tar snapshots. |
+| `pkg/sessionapi` | new | Serves the Session gRPC API (CreateSession, ListSessions, GetSession, ListMessages, SendMessage). Runs agent turns via `pkg/session`, manages session concurrency, and streams turn events. |
 | `pkg/llm` | forked from `sandboxed-tools/pkg/llm` | A minimal OpenAI-compatible chat client with tool calling, plus a `fake` for tests. Gemini and Anthropic both offer OpenAI-compatible endpoints. |
 | `pkg/tools`, `pkg/toolsets` | forked from `sandboxed-tools/pkg/{tools,toolsets}` | The tool interface, the registry, output limiting, and the `basic` and `geminicli` toolsets. Our worker image ships the `geminicli-toolbox` helper binary. The new `ao` toolset adds `measure`, `open_pull_request`, `finish`, and later `start_session`. |
 | `pkg/acp` | forked from `examples/agentclientprotocol/pkg/acp` | An Agent Client Protocol client. We use it to drive inner CLI agents that speak ACP, such as gemini-cli with `--acp`, over a sandboxd `Start` stream. This gives us streamed tool calls and permission gating without parsing terminal output. |
@@ -233,6 +234,23 @@ We change the upstream example in five ways.
 - **Model access** differs by session kind. The control plane calls the model
   with the platform keys for native sessions. Inner CLI agents inside the
   sandbox reach the model APIs through the portal sidecar.
+
+### Session API
+
+The control plane exposes a gRPC service defined in `api/session/v1/session.proto`
+and served by `ao serve`. It provides five RPCs: `CreateSession`, `ListSessions`,
+`GetSession`, `ListMessages`, and `SendMessage`.
+
+`SendMessage` appends a user message and runs one turn of the agentic loop,
+streaming events (`MessageAppended`, `ToolCallStarted`, `ToolCallFinished`,
+`TurnFinished`, `Error`) until the turn completes. Only one turn runs at a time
+per session; a second `SendMessage` call on a busy session returns
+`FAILED_PRECONDITION`. Tool calls are auto-approved by the server. Sandboxes are
+created lazily on the first tool call and reused across turns of the same session.
+
+The server binds to localhost by default (`127.0.0.1:8081`) and provides no
+authentication in this phase; it must not be exposed to untrusted networks.
+Authentication and authorization will be added alongside the GitHub App.
 
 ### The `ao` toolset for phase 1
 
