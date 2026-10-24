@@ -67,3 +67,54 @@ To use the gemini-cli tool surface (`read_file`, `write_file`, `replace`, `grep_
 ```bash
 ./bin/ao session run --session my-session --toolset geminicli
 ```
+
+## Running the Session API Server (`ao serve`)
+
+`ao serve` starts the gRPC session service, executing turns and managing sandboxes through a server interface rather than an in-process REPL:
+
+```bash
+./bin/ao serve --listen 127.0.0.1:8081
+```
+
+The listen address defaults to `127.0.0.1:8081`, configurable via `--listen` or the `AO_LISTEN` environment variable.
+
+> **Security Note**: The server provides no authentication in this milestone and listens on `127.0.0.1:8081` by default. It must not be exposed to untrusted networks.
+
+### Admin CLI Subcommands
+
+With `ao serve` running, use the `ao session` client subcommands (all take `--server`, defaulting to `127.0.0.1:8081` or the `AO_SERVER` environment variable):
+
+1. **List sessions**:
+   ```bash
+   ./bin/ao session list
+   ```
+
+2. **Send a message and stream events**:
+   ```bash
+   ./bin/ao session send demo "what is the capital of France?"
+   ```
+   If the session does not exist, `ao session send` creates it automatically. Tool progress and errors stream as they arrive, and the final assistant reply is printed last.
+
+   *Note on System Prompt Visibility*: The first `SendMessage` on a new session initializes the system prompt and streams it to the client as a `MessageAppended` event. This is expected behavior for an admin CLI inspecting the session history, but when authentication and non-admin clients are introduced in later milestones, streaming of the internal system prompt may be restricted or filtered based on client authorization.
+
+3. **Inspect session messages**:
+   ```bash
+   ./bin/ao session get demo
+   ```
+   Prints the session messages in order, one per line, with their role. Assistant tool calls are rendered as `call: name(args)` and tool outputs as `tool: <output>`. Pass `--json` to output structured JSON for scripts.
+
+### Real-Model Path with Gemini
+
+To run against a real model using Google Gemini:
+
+1. Start the server with `GEMINI_API_KEY` set (and without an `OPENAI_MODEL` override):
+   ```bash
+   export GEMINI_API_KEY="your-api-key"
+   ./bin/ao serve
+   ```
+
+2. Send a prompt to the session:
+   ```bash
+   ./bin/ao session send demo "what is the capital of France?"
+   ```
+   The model prints an answer containing `Paris`. CI cannot run this path because it requires external credentials and network access.

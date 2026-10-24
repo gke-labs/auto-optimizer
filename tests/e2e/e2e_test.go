@@ -18,11 +18,13 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -288,4 +290,182 @@ func TestSession(t *testing.T) {
 	}
 
 	t.Logf("PASS: ao session run successfully executed in sandbox, verified output contains Linux, shutdownPolicy=%s, shutdownTime=%s", shutdownPolicy, shutdownTime)
+}
+
+func TestSessionAPI(t *testing.T) {
+	if os.Getenv("RUN_E2E") == "" {
+		t.Skip("RUN_E2E env var not set, skipping e2e session API tests")
+	}
+
+	clusterName := os.Getenv("KIND_CLUSTER_NAME")
+	if clusterName == "" {
+		clusterName = "auto-optimizer"
+	}
+
+	h := NewHarness(t, clusterName)
+	h.Setup()
+
+	gitRoot, err := h.getGitRoot()
+	if err != nil {
+		t.Fatalf("failed to get git root: %v", err)
+	}
+
+	aoBin := filepath.Join(t.TempDir(), "ao")
+	buildCmd := exec.Command("go", "build", "-o", aoBin, "./cmd/ao")
+	buildCmd.Dir = gitRoot
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to build ao binary: %v\nOutput: %s", err, string(out))
+	}
+
+	// Allocate a free port for ao serve.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to allocate free port: %v", err)
+	}
+	serverAddr := listener.Addr().String()
+	_ = listener.Close()
+
+	sessionName := "e2eapi"
+	stateDir := t.TempDir()
+
+	subH := h.WithT(t)
+	subH.DeleteWithCleanup("ao-sandboxes", "sandbox", sessionName)
+
+	serveCmd := exec.Command(aoBin, "serve",
+		"--listen", serverAddr,
+		"--state-dir", stateDir,
+	)
+	serveCmd.Env = append(os.Environ(), "OPENAI_MODEL=fake-eliza")
+
+	var serveStdout, serveStderr bytes.Buffer
+	serveCmd.Stdout = &serveStdout
+	serveCmd.Stderr = &serveStderr
+
+	t.Logf("Starting ao serve on %s...", serverAddr)
+	if err := serveCmd.Start(); err != nil {
+		t.Fatalf("failed to start ao serve: %v", err)
+	}
+	t.Cleanup(func() {
+		if serveCmd.Process != nil {
+			_ = serveCmd.Process.Signal(syscall.SIGTERM)
+			_ = serveCmd.Wait()
+		}
+	})
+
+	// Wait for server to accept connections.
+	serverReady := false
+	for range 50 {
+		conn, err := net.DialTimeout("tcp", serverAddr, 100*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			serverReady = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !serverReady {
+		t.Fatalf("timed out waiting for ao serve to become ready on %s\nStderr: %s", serverAddr, serveStderr.String())
+	}
+
+	// 1. ao session send e2eapi "run: uname -a"
+	sendCmd := exec.Command(aoBin, "session", "send", sessionName, "run: uname -a",
+		"--server", serverAddr,
+	)
+	sendCmd.Env = append(os.Environ(), "OPENAI_MODEL=fake-eliza")
+
+	var sendStdout, sendStderr bytes.Buffer
+	sendCmd.Stdout = &sendStdout
+	sendCmd.Stderr = &sendStderr
+
+	t.Logf("Running ao session send %s...", sessionName)
+	if err := sendCmd.Run(); err != nil {
+		t.Fatalf("ao session send failed: %v\nStdout: %s\nStderr: %s\nServer Stderr: %s",
+			err, sendStdout.String(), sendStderr.String(), serveStderr.String())
+	}
+
+	sendOutput := sendStdout.String()
+	t.Logf("ao session send output:\n%s", sendOutput)
+
+	if !strings.Contains(sendOutput, "Linux") {
+		t.Fatalf("expected output to contain 'Linux', got:\n%s", sendOutput)
+	}
+
+	// 2. ao session list --server <serverAddr>
+	listCmd := exec.Command(aoBin, "session", "list",
+		"--server", serverAddr,
+	)
+	var listStdout, listStderr bytes.Buffer
+	listCmd.Stdout = &listStdout
+	listCmd.Stderr = &listStderr
+
+	t.Logf("Running ao session list...")
+	if err := listCmd.Run(); err != nil {
+		t.Fatalf("ao session list failed: %v\nStdout: %s\nStderr: %s", err, listStdout.String(), listStderr.String())
+	}
+
+	listOutput := listStdout.String()
+	t.Logf("ao session list output:\n%s", listOutput)
+	if !strings.Contains(listOutput, sessionName) {
+		t.Fatalf("expected ao session list to contain %q, got:\n%s", sessionName, listOutput)
+	}
+
+	// 3. ao session get e2eapi --server <serverAddr>
+	getCmd := exec.Command(aoBin, "session", "get", sessionName,
+		"--server", serverAddr,
+	)
+	var getStdout, getStderr bytes.Buffer
+	getCmd.Stdout = &getStdout
+	getCmd.Stderr = &getStderr
+
+	t.Logf("Running ao session get %s...", sessionName)
+	if err := getCmd.Run(); err != nil {
+		t.Fatalf("ao session get failed: %v\nStdout: %s\nStderr: %s", err, getStdout.String(), getStderr.String())
+	}
+
+	getOutput := getStdout.String()
+	t.Logf("ao session get output:\n%s", getOutput)
+	if !strings.Contains(getOutput, "run: uname -a") || !strings.Contains(getOutput, "Linux") {
+		t.Fatalf("expected ao session get output to contain messages with 'run: uname -a' and 'Linux', got:\n%s", getOutput)
+	}
+
+	// 3b. Verify ao session get --json produces valid JSON
+	getJSONCmd := exec.Command(aoBin,
+		"session", "get", sessionName,
+		"--server", serverAddr,
+		"--json",
+	)
+	var getJSONStdout, getJSONStderr bytes.Buffer
+	getJSONCmd.Stdout = &getJSONStdout
+	getJSONCmd.Stderr = &getJSONStderr
+
+	t.Logf("Running ao session get %s --json...", sessionName)
+	if err := getJSONCmd.Run(); err != nil {
+		t.Fatalf("ao session get --json failed: %v\nStdout: %s\nStderr: %s", err, getJSONStdout.String(), getJSONStderr.String())
+	}
+	getJSONOutput := getJSONStdout.String()
+	if !strings.Contains(getJSONOutput, `"messages"`) || !strings.Contains(getJSONOutput, `"role"`) {
+		t.Fatalf("expected JSON output from ao session get --json, got:\n%s", getJSONOutput)
+	}
+
+	// 4. Verify sandbox was created in ao-sandboxes with shutdownPolicy: Delete and shutdownTime
+	sbJSON, err := subH.Kubectl("get", "sandbox", "-n", "ao-sandboxes", sessionName, "-o", "jsonpath={.spec.shutdownPolicy} {.spec.shutdownTime}")
+	if err != nil {
+		t.Fatalf("failed to get sandbox %s in ao-sandboxes: %v", sessionName, err)
+	}
+
+	parts := strings.Fields(sbJSON)
+	if len(parts) < 2 {
+		t.Fatalf("expected shutdownPolicy and shutdownTime, got: %q", sbJSON)
+	}
+	shutdownPolicy := parts[0]
+	shutdownTime := parts[1]
+
+	if shutdownPolicy != "Delete" {
+		t.Errorf("shutdownPolicy = %q, want Delete", shutdownPolicy)
+	}
+	if shutdownTime == "" {
+		t.Errorf("shutdownTime is empty")
+	}
+
+	t.Logf("PASS: ao serve + session send/list/get successfully verified in kind, shutdownPolicy=%s, shutdownTime=%s", shutdownPolicy, shutdownTime)
 }
