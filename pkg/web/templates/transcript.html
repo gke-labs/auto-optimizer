@@ -1,0 +1,64 @@
+{{define "content"}}
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Session: {{.Summary.Name}}</h1>
+    <div class="meta-badges">
+      <span class="meta-badge">toolset: {{.Summary.Toolset}}</span>
+      {{if .Summary.Parent}}<span class="meta-badge">parent: {{.Summary.Parent}}</span>{{end}}
+      <span class="meta-badge">created: {{.FormattedCreatedAt}}</span>
+      {{if .Summary.InFlight}}
+      <span class="badge badge-in-flight">turn in flight</span>
+      {{else}}
+      <span class="badge badge-idle">idle</span>
+      {{end}}
+    </div>
+  </div>
+</div>
+
+<div class="transcript-container">
+  {{if .Messages}}
+    {{range .Messages}}
+    <div class="message-card role-{{.Role}}">
+      <div class="message-role">{{.Role}}</div>
+      {{if .IsTool}}
+        <details class="tool-result">
+          <summary>Tool Result{{if .ToolCallID}} ({{.ToolCallID}}){{end}}</summary>
+          <pre>{{.Content}}</pre>
+        </details>
+      {{else}}
+        {{if .Content}}
+          <div class="message-content">
+            {{if .Truncated}}
+              {{.DisplayContent}}
+              <div><a href="/sessions/{{$.Summary.Name}}?full=1" class="show-all-link">show all</a></div>
+            {{else}}
+              {{.DisplayContent}}
+              {{if and $.Full .CanTruncate}}
+                <div><a href="/sessions/{{$.Summary.Name}}" class="show-all-link">show less</a></div>
+              {{end}}
+            {{end}}
+          </div>
+        {{end}}
+        {{range .ToolCalls}}
+          <div class="tool-call"><code>{{.Name}}({{.Arguments}})</code></div>
+        {{end}}
+      {{end}}
+    </div>
+    {{end}}
+  {{else}}
+    <div class="card empty-state">
+      <p>No messages in this session yet.</p>
+    </div>
+  {{end}}
+</div>
+
+<div class="card message-form-section">
+  <h3>Send Message</h3>
+  <form action="/sessions/{{.Summary.Name}}/messages" method="POST" class="message-form">
+    <div class="form-group">
+      <textarea name="text" rows="3" required placeholder="Type a message to the agent..."></textarea>
+    </div>
+    <button type="submit" class="btn primary" {{if .Summary.InFlight}}disabled{{end}}>Send</button>
+  </form>
+</div>
+{{end}}
