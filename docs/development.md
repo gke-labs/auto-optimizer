@@ -149,6 +149,18 @@ Prepares a local `kind` cluster and deploys dependencies for end-to-end testing.
 
 ---
 
+## Accessing the Web UI
+
+To access the server-rendered web UI running in the cluster:
+
+```bash
+kubectl -n ao-system port-forward svc/ao 8080:8080
+```
+
+Open `http://localhost:8080` in your browser to view sessions and transcripts.
+
+---
+
 ## End-to-End Testing
 
 End-to-end tests are implemented in `tests/e2e/e2e_test.go` using the test harness in `tests/e2e/harness.go`. Tests skip automatically unless `RUN_E2E=1` is set, ensuring unit test runs (`ap test`, `go test ./...`) pass without a Kubernetes cluster.
