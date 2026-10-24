@@ -103,6 +103,22 @@ With `ao serve` running, use the `ao session` client subcommands (all take `--se
    ```
    Prints the session messages in order, one per line, with their role. Assistant tool calls are rendered as `call: name(args)` and tool outputs as `tool: <output>`. Pass `--json` to output structured JSON for scripts.
 
+### Web UI
+
+`ao serve` also serves an embedded server-rendered web UI on `--http` (`127.0.0.1:8080` by default, configurable via `--http` or the `AO_HTTP` environment variable):
+
+```bash
+./bin/ao serve --listen 127.0.0.1:8081 --http 127.0.0.1:8080
+```
+
+Open `http://127.0.0.1:8080/` in a browser to:
+- View all active sessions and whether a turn is in flight.
+- Create new sessions using the form on `/`.
+- View transcripts with tool calls and expandable tool results at `/sessions/{name}`.
+- Send messages directly to sessions from the browser form; pages auto-refresh while turns execute.
+
+Cross-site form submissions are protected via a `SameSite=Strict` cookie.
+
 ### Real-Model Path with Gemini
 
 To run against a real model using Google Gemini:

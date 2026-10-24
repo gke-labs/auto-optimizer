@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,10 +35,12 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/sessionapi"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
 	"github.com/gke-labs/auto-optimizer/pkg/toolsets"
+	"github.com/gke-labs/auto-optimizer/pkg/web"
 )
 
 type serveFlags struct {
 	listen      string
+	http        string
 	namespace   string
 	toolset     string
 	image       string
@@ -52,6 +55,11 @@ func newServeCommand() *cobra.Command {
 	defaultListen := os.Getenv("AO_LISTEN")
 	if defaultListen == "" {
 		defaultListen = "127.0.0.1:8081"
+	}
+
+	defaultHTTP := os.Getenv("AO_HTTP")
+	if defaultHTTP == "" {
+		defaultHTTP = "127.0.0.1:8080"
 	}
 
 	defaultNamespace := os.Getenv("SANDBOX_NAMESPACE")
@@ -86,6 +94,7 @@ func newServeCommand() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&flags.listen, "listen", defaultListen, "Address and port to listen on; must not be exposed to untrusted networks")
+	cmd.Flags().StringVar(&flags.http, "http", defaultHTTP, "Address and port for the HTTP web UI; must not be exposed to untrusted networks")
 	cmd.Flags().StringVar(&flags.namespace, "namespace", defaultNamespace, "Kubernetes namespace where sandbox pods are created")
 	cmd.Flags().StringVar(&flags.toolset, "toolset", defaultToolset, fmt.Sprintf("Default toolset to expose to the LLM (%s)", strings.Join(toolsets.Names(), ", ")))
 	cmd.Flags().StringVar(&flags.image, "image", defaultImage, "Default sandbox container image (overrides toolset default)")
@@ -185,18 +194,52 @@ func runServe(ctx context.Context, flags serveFlags) error {
 
 	log.Info("session server listening", "listen", flags.listen, "stateDir", stateDir)
 
-	errCh := make(chan error, 1)
+	var httpListener net.Listener
+	var httpServer *http.Server
+	if flags.http != "" {
+		webHandler, err := web.NewServer(srv)
+		if err != nil {
+			return fmt.Errorf("initializing web server: %w", err)
+		}
+		httpListener, err = net.Listen("tcp", flags.http)
+		if err != nil {
+			return fmt.Errorf("failed to listen on HTTP %s: %w", flags.http, err)
+		}
+		defer func() {
+			if closeErr := httpListener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+				log.V(2).Info("failed to close HTTP listener", "error", closeErr)
+			}
+		}()
+		httpServer = &http.Server{Handler: webHandler}
+		log.Info("web UI listening", "http", flags.http)
+	}
+
+	errCh := make(chan error, 2)
 	go func() {
 		if err := grpcServer.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			errCh <- err
 		}
-		close(errCh)
 	}()
+
+	if httpServer != nil {
+		go func() {
+			if err := httpServer.Serve(httpListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+			}
+		}()
+	}
 
 	select {
 	case <-ctx.Done():
 		log.Info("shutting down session server...")
 		grpcServer.GracefulStop()
+		if httpServer != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := httpServer.Shutdown(shutdownCtx); err != nil {
+				log.V(2).Info("HTTP server shutdown error", "error", err)
+			}
+		}
 		return nil
 	case err := <-errCh:
 		return err

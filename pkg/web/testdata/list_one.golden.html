@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  
+  <title>Sessions · auto-optimizer</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="header-bar">
+    <div class="header-brand">
+      <a href="/" class="header-logo">auto-optimizer</a>
+      <nav class="header-nav">
+        <a href="/">Sessions</a>
+      </nav>
+    </div>
+  </header>
+  <main class="main-content">
+    
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Agent Sessions</h1>
+    <p class="page-subtitle">Track, inspect, and interact with agent sessions</p>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Active Sessions</h2>
+  
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Toolset</th>
+          <th>Parent</th>
+          <th>Created</th>
+          <th>Messages</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        
+        <tr>
+          <td><a href="/sessions/alpha"><strong>alpha</strong></a></td>
+          <td><code>basic</code></td>
+          <td><span class="text-muted">-</span></td>
+          <td>2026-10-24 12:00:00 UTC</td>
+          <td>3</td>
+          <td>
+            
+            <span class="badge badge-idle">idle</span>
+            
+          </td>
+        </tr>
+        
+      </tbody>
+    </table>
+  </div>
+  
+</div>
+
+<div class="card">
+  <h2>New Session</h2>
+  <form action="/sessions" method="POST" class="session-form">
+    <div class="form-group">
+      <label for="name">Session Name</label>
+      <input type="text" id="name" name="name" required placeholder="lowercase alphanumeric, e.g. demo">
+    </div>
+    <div class="form-group">
+      <label for="toolset">Toolset</label>
+      <input type="text" id="toolset" name="toolset" value="basic" placeholder="basic">
+    </div>
+    <button type="submit" class="btn primary">Create Session</button>
+  </form>
+</div>
+
+  </main>
+</body>
+</html>

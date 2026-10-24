@@ -1,0 +1,65 @@
+{{define "content"}}
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Agent Sessions</h1>
+    <p class="page-subtitle">Track, inspect, and interact with agent sessions</p>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Active Sessions</h2>
+  {{if .Sessions}}
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Toolset</th>
+          <th>Parent</th>
+          <th>Created</th>
+          <th>Messages</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Sessions}}
+        <tr>
+          <td><a href="/sessions/{{.Name}}"><strong>{{.Name}}</strong></a></td>
+          <td><code>{{.Toolset}}</code></td>
+          <td>{{if .Parent}}<code>{{.Parent}}</code>{{else}}<span class="text-muted">-</span>{{end}}</td>
+          <td>{{.FormattedCreatedAt}}</td>
+          <td>{{.MessageCount}}</td>
+          <td>
+            {{if .InFlight}}
+            <span class="badge badge-in-flight">in flight</span>
+            {{else}}
+            <span class="badge badge-idle">idle</span>
+            {{end}}
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <div class="empty-state">
+    <p>No agent sessions found.</p>
+  </div>
+  {{end}}
+</div>
+
+<div class="card">
+  <h2>New Session</h2>
+  <form action="/sessions" method="POST" class="session-form">
+    <div class="form-group">
+      <label for="name">Session Name</label>
+      <input type="text" id="name" name="name" required placeholder="lowercase alphanumeric, e.g. demo">
+    </div>
+    <div class="form-group">
+      <label for="toolset">Toolset</label>
+      <input type="text" id="toolset" name="toolset" value="basic" placeholder="basic">
+    </div>
+    <button type="submit" class="btn primary">Create Session</button>
+  </form>
+</div>
+{{end}}

@@ -1,0 +1,7 @@
+{{define "content"}}
+<div class="card error-page">
+  <h1 class="page-title">409 Conflict</h1>
+  <p>Session "{{.Name}}" is currently busy running a turn.</p>
+  <p><a href="/sessions/{{.Name}}" class="btn primary">Back to Session</a></p>
+</div>
+{{end}}

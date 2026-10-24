@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  
+  <title>Session idle-session · auto-optimizer</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="header-bar">
+    <div class="header-brand">
+      <a href="/" class="header-logo">auto-optimizer</a>
+      <nav class="header-nav">
+        <a href="/">Sessions</a>
+      </nav>
+    </div>
+  </header>
+  <main class="main-content">
+    
+<div class="page-header">
+  <div>
+    <h1 class="page-title">Session: idle-session</h1>
+    <div class="meta-badges">
+      <span class="meta-badge">toolset: basic</span>
+      
+      <span class="meta-badge">created: 2026-10-24 12:00:00 UTC</span>
+      
+      <span class="badge badge-idle">idle</span>
+      
+    </div>
+  </div>
+</div>
+
+<div class="transcript-container">
+  
+    
+    <div class="message-card role-user">
+      <div class="message-role">user</div>
+      
+        
+          <div class="message-content">
+            
+              hello
+              
+            
+          </div>
+        
+        
+      
+    </div>
+    
+    <div class="message-card role-assistant">
+      <div class="message-role">assistant</div>
+      
+        
+          <div class="message-content">
+            
+              Hello! How can I help you today?
+              
+            
+          </div>
+        
+        
+      
+    </div>
+    
+  
+</div>
+
+<div class="card message-form-section">
+  <h3>Send Message</h3>
+  <form action="/sessions/idle-session/messages" method="POST" class="message-form">
+    <div class="form-group">
+      <textarea name="text" rows="3" required placeholder="Type a message to the agent..."></textarea>
+    </div>
+    <button type="submit" class="btn primary" >Send</button>
+  </form>
+</div>
+
+  </main>
+</body>
+</html>
