@@ -69,6 +69,65 @@ Installs all cluster infrastructure and prerequisites needed by `auto-optimizer`
    - Waits for the `wal-buffer` StatefulSet, `objectfs-controller` StatefulSet, and `objectfs-node-daemon` DaemonSet to roll out successfully.
    - Waits for the `objectfs-exclusive-local` StorageClass to be established.
 
+5. **auto-optimizer (`ao`)**:
+   - Deploys control plane manifests in `k8s/ao.yaml`:
+     - `ServiceAccount` `ao` in `ao-system`.
+     - `Role` and `RoleBinding` in `ao-sandboxes` granting least-privilege access to manage `sandboxes` and sandbox execution.
+     - `ConfigMap` `ao-config` in `ao-system` setting server and sandbox configuration.
+     - `Deployment` `ao` in `ao-system` running `ao serve` with an `emptyDir` state volume and read-only root filesystem.
+     - `Service` `ao` ClusterIP on port 8081 named `grpc`.
+   - Builds container images (`ao`, `geminicli-toolbox`) and loads them into kind (or pushes to `IMAGE_PREFIX`).
+   - Runs `ap deploy` to apply manifests with image tags replaced.
+   - On kind, configures `OPENAI_MODEL=fake-eliza` and `SANDBOX_IMAGE=${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}` in `ao-config` by default.
+   - Waits for `deployment/ao` in `ao-system` to roll out.
+
+#### Interacting with the In-Cluster Control Plane
+
+##### Connecting to the In-Cluster Server
+
+After `deploy-to-kube` completes, port-forward the `ao` service to your machine:
+
+```bash
+kubectl -n ao-system port-forward svc/ao 8081:8081
+```
+
+In another terminal, use `ao session send` to send a prompt to the in-cluster server:
+
+```bash
+ao session send demo "run: uname -a"
+```
+
+The command streams events from the server and outputs the assistant's reply. You can verify the sandbox created by the server in the sandbox namespace:
+
+```bash
+kubectl get sandboxes -n ao-sandboxes
+```
+
+Client commands default to `--server 127.0.0.1:8081` (configurable via `--server` or the `AO_SERVER` environment variable).
+
+##### Configuring a Real Model (e.g. Gemini)
+
+By default on kind, `deploy-to-kube` sets `OPENAI_MODEL=fake-eliza` so no external API keys are needed.
+
+To use a real model such as Gemini:
+
+1. Create the `ao-model-keys` secret in `ao-system` with your API key:
+   ```bash
+   kubectl create secret generic ao-model-keys \
+     -n ao-system \
+     --from-literal=GEMINI_API_KEY="your-api-key"
+   ```
+
+2. Pass `OPENAI_MODEL` when running `deploy-to-kube`:
+   ```bash
+   OPENAI_MODEL=gemini-2.5-flash ./dev/tasks/deploy-to-kube
+   ```
+   Or update the `ao-config` ConfigMap directly and restart the deployment:
+   ```bash
+   kubectl -n ao-system patch configmap ao-config --type=merge -p '{"data":{"OPENAI_MODEL":"gemini-2.5-flash"}}'
+   kubectl -n ao-system rollout restart deploy/ao
+   ```
+
 #### Idempotence
 
 `deploy-to-kube` is idempotent. Running it a second time against an already-configured cluster will make no changes, detect existing resources and rollouts, and exit `0` within seconds. Sibling checkouts are cached and reused at their pinned commits.
