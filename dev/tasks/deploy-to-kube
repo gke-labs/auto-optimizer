@@ -43,6 +43,26 @@ if [[ "${CURRENT_CONTEXT}" == kind-* ]]; then
   KIND_CLUSTER_NAME="${CURRENT_CONTEXT#kind-}"
 fi
 
+ensure_docker_cli() {
+  if ! command -v docker >/dev/null 2>&1; then
+    local docker_version="29.2.1"
+    local docker_bin="${REPO_ROOT}/.build/src/docker/${docker_version}/bin/docker"
+    if [[ ! -x "${docker_bin}" ]]; then
+      echo "Installing docker ${docker_version}..." >&2
+      mkdir -p "$(dirname "${docker_bin}")"
+      curl -sLo "${REPO_ROOT}/.build/src/docker/${docker_version}/docker.tgz" "https://download.docker.com/linux/static/stable/x86_64/docker-${docker_version}.tgz"
+      tar -C "$(dirname "${docker_bin}")" -xzf "${REPO_ROOT}/.build/src/docker/${docker_version}/docker.tgz" --strip-components=1 docker/docker
+      rm "${REPO_ROOT}/.build/src/docker/${docker_version}/docker.tgz"
+      chmod +x "${docker_bin}"
+    fi
+    mkdir -p "${REPO_ROOT}/.build/bin"
+    ln -sf "../src/docker/${docker_version}/bin/docker" "${REPO_ROOT}/.build/bin/docker"
+    export PATH="${REPO_ROOT}/.build/bin:${PATH}"
+  fi
+}
+
+ensure_docker_cli
+
 # Note: ap builds container images by invoking 'docker buildx build' under the hood
 # (see gke-labs-infra/ap/pkg/images/build.go). When running in minimal environments
 # (such as container agents with a remote DOCKER_HOST daemon), the docker CLI and
@@ -297,5 +317,65 @@ if [[ "${SC_FOUND}" != "true" ]]; then
   echo "ERROR: StorageClass objectfs-exclusive-local was not found after waiting." >&2
   exit 1
 fi
+
+# ------------------------------------------------------------------------------
+# 5. auto-optimizer (ao)
+# ------------------------------------------------------------------------------
+echo "--- Deploying auto-optimizer with ap ---"
+
+if [[ "${IS_KIND}" == "true" ]]; then
+  echo "Building auto-optimizer images..."
+  (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest build)
+  echo "Loading auto-optimizer images into kind cluster ${KIND_CLUSTER_NAME}..."
+  kind load docker-image \
+    "${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}" \
+    "${IMAGE_PREFIX}/ao:${IMAGE_TAG}" \
+    --name "${KIND_CLUSTER_NAME}"
+
+  echo "Deploying auto-optimizer manifests with ap deploy..."
+  (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy --skip-push)
+
+  OPENAI_MODEL="${OPENAI_MODEL:-fake-eliza}"
+  SANDBOX_IMAGE="${SANDBOX_IMAGE:-${IMAGE_PREFIX}/geminicli-toolbox:${IMAGE_TAG}}"
+
+  echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL}, SANDBOX_IMAGE=${SANDBOX_IMAGE})..."
+  cat << EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ao-config
+  namespace: ao-system
+data:
+  AO_LISTEN: "0.0.0.0:8081"
+  SANDBOX_NAMESPACE: "ao-sandboxes"
+  OPENAI_MODEL: "${OPENAI_MODEL}"
+  SANDBOX_IMAGE: "${SANDBOX_IMAGE}"
+EOF
+
+  kubectl rollout restart deployment/ao -n ao-system
+else
+  echo "Deploying auto-optimizer with ap deploy (pushing to ${IMAGE_PREFIX})..."
+  (cd "${REPO_ROOT}" && GOTOOLCHAIN=auto go run github.com/gke-labs/gke-labs-infra/ap@latest deploy)
+
+  if [[ -n "${OPENAI_MODEL:-}" || -n "${SANDBOX_IMAGE:-}" ]]; then
+    echo "Configuring ao-config ConfigMap (OPENAI_MODEL=${OPENAI_MODEL:-}, SANDBOX_IMAGE=${SANDBOX_IMAGE:-})..."
+    cat << EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ao-config
+  namespace: ao-system
+data:
+  AO_LISTEN: "0.0.0.0:8081"
+  SANDBOX_NAMESPACE: "ao-sandboxes"
+  OPENAI_MODEL: "${OPENAI_MODEL:-}"
+  SANDBOX_IMAGE: "${SANDBOX_IMAGE:-}"
+EOF
+    kubectl rollout restart deployment/ao -n ao-system
+  fi
+fi
+
+echo "Waiting for ao deployment in ao-system..."
+kubectl rollout status deployment/ao -n ao-system --timeout=120s
 
 echo "=== deploy-to-kube completed successfully ==="
