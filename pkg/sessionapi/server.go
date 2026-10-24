@@ -18,6 +18,8 @@ package sessionapi
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -30,6 +32,40 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+// ErrBusy is returned when a turn is already in flight for the session.
+var ErrBusy = errors.New("session is busy")
+
+// SessionSummary summarizes an agent session for in-process consumers such as the web UI.
+type SessionSummary struct {
+	Name         string
+	Toolset      string
+	Parent       string
+	CreatedAt    time.Time
+	MessageCount int
+	InFlight     bool
+}
+
+// ToolCall represents an assistant tool call.
+type ToolCall struct {
+	ID        string
+	Name      string
+	Arguments string
+}
+
+// Message represents a single message in a session transcript.
+type Message struct {
+	Role       string
+	Content    string
+	ToolCallID string
+	ToolCalls  []ToolCall
+}
+
+// SessionDetail represents the full session transcript and metadata.
+type SessionDetail struct {
+	Summary  SessionSummary
+	Messages []Message
+}
 
 // ServerOptions configures a SessionService Server.
 type ServerOptions struct {
@@ -274,43 +310,9 @@ func (s *Server) SendMessage(req *sessionv1.SendMessageRequest, stream sessionv1
 		s.mu.Unlock()
 	}()
 
-	s.mu.Lock()
-	sess := s.activeSessions[name]
-	s.mu.Unlock()
-
-	if sess == nil {
-		defaultHarness, err := s.harnessFactory(s.defaultToolset)
-		if err != nil {
-			return status.Errorf(codes.Internal, "resolving default harness: %v", err)
-		}
-		loaded, err := defaultHarness.LoadSession(ctx, s.store, name)
-		if err != nil {
-			if errors.Is(err, session.ErrNotFound) {
-				loaded, err = defaultHarness.NewSession(ctx, s.store, name, session.Metadata{
-					Toolset:   s.defaultToolset,
-					CreatedAt: time.Now(),
-				})
-				if err != nil {
-					return status.Errorf(codes.Internal, "creating session %q: %v", name, err)
-				}
-				log.Info("auto-created session on send", "session", name, "toolset", s.defaultToolset)
-			} else {
-				return status.Errorf(codes.Internal, "loading session %q: %v", name, err)
-			}
-		}
-		sess = loaded
-		s.mu.Lock()
-		s.activeSessions[name] = sess
-		s.mu.Unlock()
-	}
-
-	toolset := sess.Metadata.Toolset
-	if toolset == "" {
-		toolset = s.defaultToolset
-	}
-	harness, err := s.harnessFactory(toolset)
+	sess, harness, err := s.getOrLoadSession(ctx, name)
 	if err != nil {
-		return status.Errorf(codes.Internal, "resolving harness for toolset %q: %v", toolset, err)
+		return status.Errorf(codes.Internal, "%v", err)
 	}
 
 	// If this is a new session without messages, ensure the system prompt is set and stream it.
@@ -447,4 +449,228 @@ func toProtoToolCall(tc llm.ToolCall) *sessionv1.ToolCall {
 			Arguments: tc.Function.Arguments,
 		},
 	}
+}
+
+func (s *Server) getOrLoadSession(ctx context.Context, name string) (*session.Session, *session.Harness, error) {
+	s.mu.Lock()
+	sess := s.activeSessions[name]
+	s.mu.Unlock()
+
+	if sess == nil {
+		defaultHarness, err := s.harnessFactory(s.defaultToolset)
+		if err != nil {
+			return nil, nil, fmt.Errorf("resolving default harness: %w", err)
+		}
+		loaded, err := defaultHarness.LoadSession(ctx, s.store, name)
+		if err != nil {
+			if errors.Is(err, session.ErrNotFound) {
+				loaded, err = defaultHarness.NewSession(ctx, s.store, name, session.Metadata{
+					Toolset:   s.defaultToolset,
+					CreatedAt: time.Now(),
+				})
+				if err != nil {
+					return nil, nil, fmt.Errorf("creating session %q: %w", name, err)
+				}
+				scoped.Log(ctx).Info("auto-created session on send", "session", name, "toolset", s.defaultToolset)
+			} else {
+				return nil, nil, fmt.Errorf("loading session %q: %w", name, err)
+			}
+		}
+		sess = loaded
+		s.mu.Lock()
+		s.activeSessions[name] = sess
+		s.mu.Unlock()
+	}
+
+	toolset := sess.Metadata.Toolset
+	if toolset == "" {
+		toolset = s.defaultToolset
+	}
+	harness, err := s.harnessFactory(toolset)
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolving harness for toolset %q: %w", toolset, err)
+	}
+
+	return sess, harness, nil
+}
+
+// ListSessionSummaries returns summaries for all known sessions, ordered newest first.
+func (s *Server) ListSessionSummaries(ctx context.Context) ([]SessionSummary, error) {
+	summaries, err := s.store.ListSessions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("listing sessions: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var result []SessionSummary
+	for _, sum := range summaries {
+		msgCount := sum.MessageCount
+		if act, ok := s.activeSessions[sum.Name]; ok {
+			msgCount = len(act.Messages())
+		}
+		result = append(result, SessionSummary{
+			Name:         sum.Name,
+			Toolset:      sum.Metadata.Toolset,
+			Parent:       sum.Metadata.Parent,
+			CreatedAt:    sum.Metadata.CreatedAt,
+			MessageCount: msgCount,
+			InFlight:     s.busySessions[sum.Name],
+		})
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].CreatedAt.After(result[j].CreatedAt)
+	})
+
+	return result, nil
+}
+
+// GetSessionDetail returns full metadata and messages for a given session.
+func (s *Server) GetSessionDetail(ctx context.Context, name string) (*SessionDetail, error) {
+	if err := session.ValidateSessionName(name); err != nil {
+		return nil, fmt.Errorf("invalid session name %q: %w", name, err)
+	}
+
+	s.mu.Lock()
+	sess, ok := s.activeSessions[name]
+	inFlight := s.busySessions[name]
+	s.mu.Unlock()
+
+	var messages []llm.Message
+	var meta session.Metadata
+	if ok {
+		meta = sess.Metadata
+		messages = sess.Messages()
+	} else {
+		var loadedMeta *session.Metadata
+		var err error
+		messages, loadedMeta, err = s.store.LoadSession(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		if loadedMeta != nil {
+			meta = *loadedMeta
+		}
+	}
+
+	var webMsgs []Message
+	for _, m := range messages {
+		var content string
+		if m.Content != nil {
+			content = *m.Content
+		}
+		var tcs []ToolCall
+		for _, tc := range m.ToolCalls {
+			tcs = append(tcs, ToolCall{
+				ID:        tc.ID,
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			})
+		}
+		webMsgs = append(webMsgs, Message{
+			Role:       m.Role,
+			Content:    content,
+			ToolCallID: m.ToolCallID,
+			ToolCalls:  tcs,
+		})
+	}
+
+	return &SessionDetail{
+		Summary: SessionSummary{
+			Name:         name,
+			Toolset:      meta.Toolset,
+			Parent:       meta.Parent,
+			CreatedAt:    meta.CreatedAt,
+			MessageCount: len(messages),
+			InFlight:     inFlight,
+		},
+		Messages: webMsgs,
+	}, nil
+}
+
+// CreateNewSession creates a session with the specified name and toolset.
+func (s *Server) CreateNewSession(ctx context.Context, name, toolset string) error {
+	_, err := s.CreateSession(ctx, &sessionv1.CreateSessionRequest{
+		Name:    name,
+		Toolset: toolset,
+	})
+	return err
+}
+
+// StartTurn starts one agent turn asynchronously in the background.
+// If a turn is already running for the session, ErrBusy is returned.
+func (s *Server) StartTurn(ctx context.Context, name, text string) error {
+	if err := session.ValidateSessionName(name); err != nil {
+		return fmt.Errorf("invalid session name %q: %w", name, err)
+	}
+	if text == "" {
+		return errors.New("message text is required")
+	}
+
+	s.mu.Lock()
+	if s.busySessions[name] {
+		s.mu.Unlock()
+		return ErrBusy
+	}
+	s.busySessions[name] = true
+	s.mu.Unlock()
+
+	sess, harness, err := s.getOrLoadSession(ctx, name)
+	if err != nil {
+		s.mu.Lock()
+		delete(s.busySessions, name)
+		s.mu.Unlock()
+		return err
+	}
+
+	go func() {
+		defer func() {
+			s.mu.Lock()
+			delete(s.busySessions, name)
+			s.mu.Unlock()
+		}()
+
+		turnCtx := context.Background()
+		log := scoped.Log(turnCtx)
+
+		if len(sess.Messages()) == 0 {
+			if err := harness.EnsureSystemPrompt(turnCtx, sess); err != nil {
+				log.Error(err, "ensuring system prompt failed", "session", name)
+				return
+			}
+		}
+
+		events := &autoApprovedTurnEvents{ctx: turnCtx}
+		if err := harness.RunTurn(turnCtx, sess, text, events); err != nil {
+			log.Error(err, "run turn failed", "session", name)
+		}
+	}()
+
+	return nil
+}
+
+type autoApprovedTurnEvents struct {
+	ctx context.Context
+}
+
+func (e *autoApprovedTurnEvents) AssistantMessage(ctx context.Context, text string) {
+	scoped.Log(ctx).V(2).Info("assistant replied", "text", text)
+}
+
+func (e *autoApprovedTurnEvents) ApproveToolCall(_ context.Context, _ llm.ToolCall) (bool, error) {
+	return true, nil
+}
+
+func (e *autoApprovedTurnEvents) ToolCallStarted(ctx context.Context, call llm.ToolCall) {
+	scoped.Log(ctx).V(2).Info("tool call started", "tool", call.Function.Name)
+}
+
+func (e *autoApprovedTurnEvents) ToolCallFinished(ctx context.Context, call llm.ToolCall, err error) {
+	scoped.Log(ctx).V(2).Info("tool call finished", "tool", call.Function.Name, "error", err)
+}
+
+func (e *autoApprovedTurnEvents) MessageAppended(ctx context.Context, msg llm.Message) {
+	scoped.Log(ctx).V(3).Info("message appended", "role", msg.Role)
 }

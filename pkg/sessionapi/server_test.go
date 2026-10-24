@@ -521,3 +521,133 @@ func eToolCallStarted(e *sessionv1.SessionEvent) *sessionv1.ToolCall {
 func eToolCallFinished(e *sessionv1.SessionEvent) *sessionv1.ToolCallFinished {
 	return e.GetToolCallFinished()
 }
+
+func newTestServer(t *testing.T, sb tools.Sandbox) (*Server, *session.FileStore) {
+	t.Helper()
+
+	llmClient, err := llm.NewFromEnv("fake-eliza")
+	if err != nil {
+		t.Fatalf("llm.NewFromEnv: %v", err)
+	}
+
+	toolset, err := toolsets.Get("basic")
+	if err != nil {
+		t.Fatalf("toolsets.Get: %v", err)
+	}
+
+	toolsRegistry := tools.NewRegistry()
+	toolsRegistry.ToolTimeout = session.DefaultToolTimeout
+	toolset.RegisterTools(toolsRegistry)
+
+	var opts session.RunOptions
+	opts.InitDefaults()
+	opts.ModelName = "fake-eliza"
+	opts.SystemPrompt = toolset.SystemPrompt()
+
+	harness := session.NewHarness(llmClient, nil, toolsRegistry, opts)
+	if sb != nil {
+		harness.SetSandboxOverride(sb)
+	}
+
+	store := session.NewFileStore(t.TempDir())
+
+	srv, err := NewServer(ServerOptions{
+		Store:          store,
+		DefaultToolset: "basic",
+		Harness:        harness,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	return srv, store
+}
+
+func TestWebMethods_CreateListAndGet(t *testing.T) {
+	ctx := t.Context()
+	srv, _ := newTestServer(t, nil)
+
+	if err := srv.CreateNewSession(ctx, "alpha", "basic"); err != nil {
+		t.Fatalf("CreateNewSession(alpha): %v", err)
+	}
+	if err := srv.CreateNewSession(ctx, "beta", "basic"); err != nil {
+		t.Fatalf("CreateNewSession(beta): %v", err)
+	}
+
+	summaries, err := srv.ListSessionSummaries(ctx)
+	if err != nil {
+		t.Fatalf("ListSessionSummaries: %v", err)
+	}
+	if len(summaries) != 2 {
+		t.Fatalf("got %d summaries, want 2", len(summaries))
+	}
+	if summaries[0].Name != "beta" || summaries[1].Name != "alpha" {
+		t.Errorf("unexpected order: %s, %s", summaries[0].Name, summaries[1].Name)
+	}
+
+	detail, err := srv.GetSessionDetail(ctx, "alpha")
+	if err != nil {
+		t.Fatalf("GetSessionDetail(alpha): %v", err)
+	}
+	if detail.Summary.Name != "alpha" {
+		t.Errorf("detail name = %q, want alpha", detail.Summary.Name)
+	}
+	if detail.Summary.InFlight {
+		t.Errorf("detail InFlight = true, want false")
+	}
+}
+
+func TestWebMethods_StartTurnAndBusy(t *testing.T) {
+	ctx := t.Context()
+	sb := &blockingSandbox{
+		startedCh: make(chan struct{}, 1),
+		blockCh:   make(chan struct{}),
+	}
+	srv, _ := newTestServer(t, sb)
+
+	if err := srv.CreateNewSession(ctx, "turnsess", "basic"); err != nil {
+		t.Fatalf("CreateNewSession: %v", err)
+	}
+
+	if err := srv.StartTurn(ctx, "turnsess", "run: uname -a"); err != nil {
+		t.Fatalf("StartTurn: %v", err)
+	}
+
+	// Verify session is marked busy immediately
+	detail, err := srv.GetSessionDetail(ctx, "turnsess")
+	if err != nil {
+		t.Fatalf("GetSessionDetail: %v", err)
+	}
+	if !detail.Summary.InFlight {
+		t.Errorf("InFlight = false, want true")
+	}
+
+	// A second StartTurn on a busy session must return ErrBusy
+	err = srv.StartTurn(ctx, "turnsess", "second message")
+	if !errors.Is(err, ErrBusy) {
+		t.Errorf("second StartTurn err = %v, want ErrBusy", err)
+	}
+
+	// Unblock turn execution
+	close(sb.blockCh)
+
+	// Poll until turn finishes
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		d, err := srv.GetSessionDetail(ctx, "turnsess")
+		if err == nil && !d.Summary.InFlight {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	detail, err = srv.GetSessionDetail(ctx, "turnsess")
+	if err != nil {
+		t.Fatalf("GetSessionDetail: %v", err)
+	}
+	if detail.Summary.InFlight {
+		t.Error("turn still in flight after unblocking")
+	}
+	if len(detail.Messages) == 0 {
+		t.Error("expected messages in detail after turn finished")
+	}
+}
