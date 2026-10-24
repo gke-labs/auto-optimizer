@@ -63,6 +63,8 @@ func (e *recordingEvents) ToolCallStarted(_ context.Context, _ llm.ToolCall) {}
 
 func (e *recordingEvents) ToolCallFinished(_ context.Context, _ llm.ToolCall, _ error) {}
 
+func (e *recordingEvents) MessageAppended(_ context.Context, _ llm.Message) {}
+
 func TestOneShot_FakeEliza(t *testing.T) {
 	ctx := t.Context()
 

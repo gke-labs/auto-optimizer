@@ -69,6 +69,42 @@ Installs all cluster infrastructure and prerequisites needed by `auto-optimizer`
    - Waits for the `wal-buffer` StatefulSet, `objectfs-controller` StatefulSet, and `objectfs-node-daemon` DaemonSet to roll out successfully.
    - Waits for the `objectfs-exclusive-local` StorageClass to be established.
 
+5. **auto-optimizer (Control Plane)**:
+   - Builds `ao` and `geminicli-toolbox` container images using `ap build`.
+   - On `kind`, loads the images into the kind cluster.
+   - Deploys manifests in `k8s/ao.yaml` with `ap deploy`, creating the `ao` ServiceAccount, Role and RoleBinding in `ao-sandboxes`, `ao-config` ConfigMap, `ao` Deployment, and `ao` Service in `ao-system`.
+   - Waits for `deployment/ao` in `ao-system` to roll out.
+
+#### Configuring Model Keys and Connecting to In-Cluster Server
+
+The in-cluster control plane defaults to using `OPENAI_MODEL=fake-eliza` on kind. To connect to an LLM provider such as Gemini, create the `ao-model-keys` secret in `ao-system`:
+
+```bash
+kubectl create secret generic ao-model-keys -n ao-system \
+  --from-literal=GEMINI_API_KEY="your-api-key"
+```
+
+To configure `OPENAI_MODEL` or a custom sandbox image, set environment variables before running `deploy-to-kube`:
+
+```bash
+export OPENAI_MODEL="gemini-2.5-flash"
+./dev/tasks/deploy-to-kube
+```
+
+To interact with the in-cluster control plane from your local machine:
+
+1. Port-forward the `ao` service:
+   ```bash
+   kubectl port-forward -n ao-system svc/ao 8081:8081
+   ```
+
+2. Send prompts or list sessions using the `ao` CLI:
+   ```bash
+   ao session send demo "run: uname -a" --server 127.0.0.1:8081
+   ao session list --server 127.0.0.1:8081
+   ao session get demo --server 127.0.0.1:8081
+   ```
+
 #### Idempotence
 
 `deploy-to-kube` is idempotent. Running it a second time against an already-configured cluster will make no changes, detect existing resources and rollouts, and exit `0` within seconds. Sibling checkouts are cached and reused at their pinned commits.

@@ -394,6 +394,18 @@ func (h *Harness) PortForward(namespace, target string, remotePort int) (int, fu
 	return localPort, stop
 }
 
+// PortForwardService starts a port-forward from a free local port to the specified remote service and port.
+// It returns the local address ("127.0.0.1:<port>") and an explicit stop function.
+func (h *Harness) PortForwardService(namespace, service string, remotePort int) (string, func()) {
+	h.t.Helper()
+	target := service
+	if !strings.HasPrefix(target, "svc/") && !strings.HasPrefix(target, "service/") {
+		target = "svc/" + target
+	}
+	port, stop := h.PortForward(namespace, target, remotePort)
+	return fmt.Sprintf("127.0.0.1:%d", port), stop
+}
+
 // GetPodLogs returns the logs for the specified pod and optional container.
 func (h *Harness) GetPodLogs(namespace, pod string, container ...string) string {
 	h.t.Helper()
