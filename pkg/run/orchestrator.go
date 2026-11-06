@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-logr/logr"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -290,9 +289,9 @@ func (o *Orchestrator) SetupWithManager(mgr manager.Manager) error {
 
 	if o.harness != nil && o.harness.SandboxClient() != nil && o.harness.SandboxClient().AgentsClient() != nil {
 		sbSrc := &sandboxSource{
+			orch:         o,
 			agentsClient: o.harness.SandboxClient().AgentsClient(),
 			namespace:    o.harness.Namespace(),
-			log:          scoped.Log(context.Background()),
 		}
 		if err := c.Watch(sbSrc); err != nil {
 			return fmt.Errorf("watching sandbox resources: %w", err)
@@ -300,6 +299,49 @@ func (o *Orchestrator) SetupWithManager(mgr manager.Manager) error {
 	}
 
 	return mgr.Add(o)
+}
+
+// requestsForSandbox maps a Sandbox to reconciliation requests for the run it belongs to.
+// It follows the controller owner reference to the HeroRun and reads the run ID and repository
+// from the HeroRun. If the Sandbox has no HeroRun owner, or KubeClient is nil, it falls back
+// to reading the run ID and repository from the Sandbox's own label and annotation.
+func (o *Orchestrator) requestsForSandbox(ctx context.Context, sb *sandboxv1beta1.Sandbox) []Request {
+	if sb == nil {
+		return nil
+	}
+
+	owner := metav1.GetControllerOf(sb)
+	if owner != nil && owner.Kind == "HeroRun" && o.kubeClient != nil {
+		namespace := sb.Namespace
+		if namespace == "" && o.harness != nil {
+			namespace = o.harness.Namespace()
+		}
+		var hr herorunv1alpha1.HeroRun
+		if err := o.kubeClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: owner.Name}, &hr); err != nil {
+			scoped.Log(ctx).V(2).Info("failed to get HeroRun for sandbox", "sandbox", sb.Name, "heroRun", owner.Name, "error", err)
+			return nil
+		}
+		return requestFromLabelsAndAnnotations(ctx, hr.Labels, hr.Annotations, "HeroRun")
+	}
+
+	return requestFromLabelsAndAnnotations(ctx, sb.Labels, sb.Annotations, "sandbox")
+}
+
+func requestFromLabelsAndAnnotations(ctx context.Context, labels, annotations map[string]string, source string) []Request {
+	runID := labels[LabelRun]
+	if runID == "" {
+		return nil
+	}
+	repoStr := annotations[AnnotationRepo]
+	if repoStr == "" {
+		return nil
+	}
+	key, err := state.ParseRepoKey(repoStr)
+	if err != nil {
+		scoped.Log(ctx).V(2).Info("failed to parse repo key from "+source+" annotation", "repo", repoStr, "error", err)
+		return nil
+	}
+	return []Request{{Repo: key, RunID: runID}}
 }
 
 // sandboxSource is a hand-written source.TypedSource[Request] that watches
@@ -319,9 +361,9 @@ func (o *Orchestrator) SetupWithManager(mgr manager.Manager) error {
 //     because the manager's scheme does not include the Sandbox CRD types
 //     and unit tests supply an in-memory fake clientset.
 type sandboxSource struct {
+	orch         *Orchestrator
 	agentsClient agentsclientset.Interface
 	namespace    string
-	log          logr.Logger
 }
 
 var _ source.TypedSource[Request] = (*sandboxSource)(nil)
@@ -370,28 +412,12 @@ func (s *sandboxSource) enqueueSandbox(ctx context.Context, obj any, queue workq
 		}
 	}
 
-	runID := sb.Labels[LabelRun]
-	if runID == "" {
+	if s.orch == nil {
 		return
 	}
-
-	if req := s.mapSandboxToRequest(ctx, sb, runID); req != nil {
-		queue.Add(*req)
+	for _, req := range s.orch.requestsForSandbox(ctx, sb) {
+		queue.Add(req)
 	}
-}
-
-func (s *sandboxSource) mapSandboxToRequest(ctx context.Context, sb *sandboxv1beta1.Sandbox, runID string) *Request {
-	if sb.Annotations != nil {
-		if repoStr := sb.Annotations[AnnotationRepo]; repoStr != "" {
-			key, err := state.ParseRepoKey(repoStr)
-			if err != nil {
-				s.log.V(2).Info("failed to parse repo key from sandbox annotation", "repo", repoStr, "error", err)
-				return nil
-			}
-			return &Request{Repo: key, RunID: runID}
-		}
-	}
-	return nil
 }
 
 // Start implements manager.Runnable. On manager startup it calls Resume,
