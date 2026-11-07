@@ -1442,6 +1442,31 @@ func (c *SandboxClient) DeleteSandbox(ctx context.Context, sb *Sandbox) error {
 	return nil
 }
 
+// ReleaseSandbox releases the local handle to a sandbox without deleting
+// the underlying Sandbox resource in Kubernetes.
+func (c *SandboxClient) ReleaseSandbox(sb *Sandbox) {
+	if c == nil || sb == nil {
+		return
+	}
+	if closeErr := sb.Close(); closeErr != nil {
+		scoped.Log(context.Background()).V(2).Info("error closing sandbox connection", "error", closeErr)
+	}
+	c.mutex.Lock()
+	delete(c.sandboxes, sb.NamespacedName())
+	c.mutex.Unlock()
+}
+
+// TrackedSandboxesCount returns the number of active sandboxes tracked by this client.
+// It exists for tests and metrics.
+func (c *SandboxClient) TrackedSandboxesCount() int {
+	if c == nil {
+		return 0
+	}
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return len(c.sandboxes)
+}
+
 // DeleteSandboxByName deletes a sandbox by namespace and name.
 func (c *SandboxClient) DeleteSandboxByName(ctx context.Context, namespace, name string) error {
 	id := types.NamespacedName{Namespace: namespace, Name: name}
@@ -1705,6 +1730,23 @@ func (h *Harness) GetOrAttachSandbox(sandboxName string) *Sandbox {
 	}
 	h.sandboxClient.sandboxes[id] = sb
 	return sb
+}
+
+// ReleaseSandbox releases the local handle to a sandbox without deleting
+// the underlying Sandbox resource in Kubernetes.
+func (h *Harness) ReleaseSandbox(sb *Sandbox) {
+	if h != nil && h.sandboxClient != nil {
+		h.sandboxClient.ReleaseSandbox(sb)
+	}
+}
+
+// TrackedSandboxesCount returns the number of active sandboxes tracked by the sandbox client.
+// It exists for tests and metrics.
+func (h *Harness) TrackedSandboxesCount() int {
+	if h == nil || h.sandboxClient == nil {
+		return 0
+	}
+	return h.sandboxClient.TrackedSandboxesCount()
 }
 
 // NewHarness constructs a Harness.

@@ -54,6 +54,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	herorunv1alpha1 "github.com/gke-labs/auto-optimizer/api/herorun/v1alpha1"
 	"github.com/gke-labs/auto-optimizer/pkg/forge"
@@ -150,6 +151,24 @@ func setupTestHarnessWithLLM(t *testing.T, procSrv processv1.ProcessServiceServe
 
 	harness := session.NewHarness(llmClient, sandboxClient, toolsRegistry, opts)
 	return harness, agentsCS, coreCS
+}
+
+func reconcileWorkingRun(ctx context.Context, orch *Orchestrator, req Request) (reconcile.Result, error) {
+	// First pass starts the worker
+	res, err := orch.Reconcile(ctx, req)
+	if err != nil {
+		return res, err
+	}
+	// Wait for worker to finish
+	deadline := time.Now().Add(5 * time.Second)
+	for orch.isRunActive(req.RunID) {
+		if time.Now().After(deadline) {
+			return res, fmt.Errorf("timed out waiting for worker on run %s", req.RunID)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Second pass consumes the outcome
+	return orch.Reconcile(ctx, req)
 }
 
 func TestOrchestrator_PendingToWorking(t *testing.T) {
@@ -900,8 +919,8 @@ func TestOrchestrator_Working_StartsSession_ModelStops_NoImprovement(t *testing.
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
-		t.Fatalf("orch.Reconcile: %v", err)
+	if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
 	// 1. Verify run is marked NoImprovement
@@ -1069,8 +1088,8 @@ func TestOrchestrator_Working_MaxTurns(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
-		t.Fatalf("orch.Reconcile: %v", err)
+	if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
 	// 1. Verify LLM stopped after exactly MaxTurns
@@ -1145,8 +1164,8 @@ func TestOrchestrator_Working_ExpiredSandbox_AtStart(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err == nil {
-		t.Logf("orch.Reconcile completed (errors handled)")
+	if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err == nil {
+		t.Logf("reconcileWorkingRun completed (errors handled)")
 	}
 
 	// Verify run transitioned to Failed
@@ -1276,8 +1295,8 @@ func TestOrchestrator_Working_ExpiredSandbox_DuringSession(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err == nil {
-		t.Logf("orch.Reconcile completed (errors handled)")
+	if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err == nil {
+		t.Logf("reconcileWorkingRun completed (errors handled)")
 	}
 
 	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
@@ -1370,8 +1389,8 @@ func TestOrchestrator_PendingToWorkingToNoImprovement(t *testing.T) {
 	}
 
 	// Step 3: Working -> NoImprovement
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
-		t.Fatalf("orch.Reconcile 3: %v", err)
+	if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("reconcileWorkingRun 3: %v", err)
 	}
 
 	// 1. Verify run reached NoImprovement
@@ -1508,8 +1527,8 @@ func TestOrchestrator_Working_FinishTool_EndsSession_RecordsSummary(t *testing.T
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
-		t.Fatalf("orch.Reconcile: %v", err)
+	if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
 	// 1. Verify run is in NoImprovement and has the summary recorded
@@ -1706,8 +1725,8 @@ func TestOrchestrator_Working_OrdinaryToolError_ContinuesSession(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
-		t.Fatalf("orch.Reconcile: %v", err)
+	if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
 	// 1. Verify session completed and run has the finish summary
@@ -2131,8 +2150,20 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
+	go func() {
+		_ = orch.Start(testCtx)
+	}()
+
 	// Reconcile with the cancellable context. The LLM will cancel the context during the session.
 	_, _ = orch.Reconcile(testCtx, Request{Repo: repo.Key(), RunID: runID})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for orch.isRunActive(runID) {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for worker to stop after context cancellation")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	// Check with test context: run MUST stay in Working phase
 	gotRun, err := store.GetRun(t.Context(), repo.Key(), runID)
@@ -3572,8 +3603,8 @@ func TestOrchestrator_Working_OpenPullRequest_TransitionsToSelecting(t *testing.
 	}
 	orch, store, agentsCS, repo, run := setupSelectingRun(t, state.PhaseWorking, "base-sha", &mockProcessServer{}, prLLM)
 
-	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
-		t.Fatalf("orch.Reconcile: %v", err)
+	if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: run.ID}); err != nil {
+		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
 	gotRun, err := store.GetRun(ctx, repo.Key(), run.ID)
@@ -4823,5 +4854,430 @@ func TestOrchestrator_Selecting_PushesAndOpensPullRequest_WithFakeForge(t *testi
 	}
 	if !foundExported || !foundPushed || !foundPROpened {
 		t.Errorf("expected commits_exported, branch_pushed, pull_request_opened events, got: %+v", events)
+	}
+}
+
+type blockingProcessServer struct {
+	processv1.UnimplementedProcessServiceServer
+	onCommand func(cmd []string)
+}
+
+func (s *blockingProcessServer) Execute(ctx context.Context, req *processv1.ExecuteRequest) (*processv1.ExecuteResponse, error) {
+	if s.onCommand != nil && req.Config != nil {
+		s.onCommand(req.Config.Command)
+	}
+	return &processv1.ExecuteResponse{
+		ExitCode: 0,
+		Stdout:   []byte("ok\n"),
+	}, nil
+}
+
+type blockingToolLLM struct {
+	mu        sync.Mutex
+	callCount int
+}
+
+func (b *blockingToolLLM) CreateChatCompletion(ctx context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.callCount++
+	if b.callCount == 1 {
+		args, _ := json.Marshal(map[string]any{"command": "block-test"})
+		return &llm.ChatCompletionResponse{
+			Choices: []llm.Choice{
+				{
+					Message: llm.Message{
+						Role: "assistant",
+						ToolCalls: []llm.ToolCall{
+							{
+								ID:   "call-block-1",
+								Type: "function",
+								Function: llm.FunctionCall{
+									Name:      "run_command",
+									Arguments: string(args),
+								},
+							},
+						},
+					},
+				},
+			},
+		}, nil
+	}
+	content := "done"
+	return &llm.ChatCompletionResponse{
+		Choices: []llm.Choice{
+			{
+				Message: llm.Message{
+					Role:    "assistant",
+					Content: &content,
+				},
+			},
+		},
+	}, nil
+}
+
+func TestOrchestrator_TurnWorker_DoesNotBlockOtherRepoWorkingReconcile(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+
+	repo1 := &state.Repo{
+		URL:           "https://github.com/gke-labs/repo1",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "repo1",
+		DefaultBranch: "main",
+	}
+	repo2 := &state.Repo{
+		URL:           "https://github.com/gke-labs/repo2",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "repo2",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo1); err != nil {
+		t.Fatalf("PutRepo 1: %v", err)
+	}
+	if err := store.PutRepo(ctx, repo2); err != nil {
+		t.Fatalf("PutRepo 2: %v", err)
+	}
+
+	run1ID := "20261030T120000Z-run1"
+	sb1Name := "run-20261030t120000z-run1"
+	run1 := &state.Run{
+		ID:          run1ID,
+		Repo:        repo1.Key(),
+		GoalName:    "goal1",
+		Phase:       state.PhaseWorking,
+		BaseCommit:  "commit-base1",
+		SandboxName: sb1Name,
+		Goal: &goals.Goal{
+			Name: "goal1",
+			Body: "run1 goal",
+		},
+	}
+	if err := store.PutRun(ctx, run1); err != nil {
+		t.Fatalf("PutRun 1: %v", err)
+	}
+
+	run2ID := "20261030T120000Z-run2"
+	sb2Name := "run-20261030t120000z-run2"
+	run2 := &state.Run{
+		ID:          run2ID,
+		Repo:        repo2.Key(),
+		GoalName:    "goal2",
+		Phase:       state.PhasePreparing,
+		BaseCommit:  "commit-base2",
+		SandboxName: sb2Name,
+	}
+	if err := store.PutRun(ctx, run2); err != nil {
+		t.Fatalf("PutRun 2: %v", err)
+	}
+
+	toolEntered := make(chan struct{})
+	toolRelease := make(chan struct{})
+	var enteredOnce sync.Once
+
+	procSrv := &blockingProcessServer{
+		onCommand: func(cmd []string) {
+			for _, arg := range cmd {
+				if arg == "block-test" {
+					enteredOnce.Do(func() { close(toolEntered) })
+					<-toolRelease
+					return
+				}
+			}
+		},
+	}
+
+	blockingLLM := &blockingToolLLM{}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, blockingLLM)
+
+	// Create sandboxes in fake k8s
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	for _, sbName := range []string{sb1Name, sb2Name} {
+		_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{Name: sbName, Namespace: "ao-sandboxes"},
+			Spec: sandboxv1beta1.SandboxSpec{
+				Lifecycle: sandboxv1beta1.Lifecycle{
+					ShutdownTime:   &metav1.Time{Time: time.Now().Add(5 * time.Minute)},
+					ShutdownPolicy: &policy,
+				},
+			},
+			Status: sandboxv1beta1.SandboxStatus{
+				Conditions: []metav1.Condition{
+					{
+						Type:   string(sandboxv1beta1.SandboxConditionReady),
+						Status: metav1.ConditionTrue,
+					},
+				},
+			},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("creating sandbox %s: %v", sbName, err)
+		}
+	}
+
+	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        func() time.Time { return fixedTime },
+		MaxTurns:     30,
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	// 1. Reconcile run1 (Working). This starts the turn worker, which runs in a goroutine.
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo1.Key(), RunID: run1ID}); err != nil {
+		t.Fatalf("orch.Reconcile run1: %v", err)
+	}
+
+	// Wait for run1's worker to enter the blocking tool call.
+	select {
+	case <-toolEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for run1 to enter blocking tool call")
+	}
+
+	// 2. While run1's tool call is blocked, reconcile run2 from Preparing to Working.
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo2.Key(), RunID: run2ID}); err != nil {
+		t.Fatalf("orch.Reconcile run2: %v", err)
+	}
+
+	// Verify run2 reached Working phase even though run1 is still blocked in its turn.
+	gotRun2, err := store.GetRun(ctx, repo2.Key(), run2ID)
+	if err != nil {
+		t.Fatalf("GetRun run2: %v", err)
+	}
+	if gotRun2.Phase != state.PhaseWorking {
+		t.Fatalf("expected run2 to reach Working while run1 was blocked, got %s", gotRun2.Phase)
+	}
+
+	// 3. Release run1 and let it finish.
+	close(toolRelease)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for orch.isRunActive(run1ID) {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for run1 worker to finish")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Reconcile run1 to consume outcome.
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo1.Key(), RunID: run1ID}); err != nil {
+		t.Fatalf("orch.Reconcile run1 outcome: %v", err)
+	}
+
+	gotRun1, err := store.GetRun(ctx, repo1.Key(), run1ID)
+	if err != nil {
+		t.Fatalf("GetRun run1: %v", err)
+	}
+	if gotRun1.Phase != state.PhaseNoImprovement {
+		t.Errorf("expected run1 to reach NoImprovement, got %s", gotRun1.Phase)
+	}
+}
+
+func TestOrchestrator_HandleMap_EmptyAfterTerminalTransition(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	// Case 1: Terminal transition to PhaseNoImprovement
+	t.Run("NoImprovement", func(t *testing.T) {
+		runID := "20261030T120000Z-term-noimp"
+		sandboxName := "run-term-noimp"
+		run := &state.Run{
+			ID:          runID,
+			Repo:        repo.Key(),
+			GoalName:    "goal-noimp",
+			Phase:       state.PhaseWorking,
+			BaseCommit:  "base-sha",
+			SandboxName: sandboxName,
+		}
+		if err := store.PutRun(ctx, run); err != nil {
+			t.Fatalf("PutRun: %v", err)
+		}
+
+		harness, agentsCS, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
+		policy := sandboxv1beta1.ShutdownPolicyDelete
+		_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: "ao-sandboxes"},
+			Spec:       sandboxv1beta1.SandboxSpec{Lifecycle: sandboxv1beta1.Lifecycle{ShutdownTime: &metav1.Time{Time: time.Now().Add(5 * time.Minute)}, ShutdownPolicy: &policy}},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("creating sandbox: %v", err)
+		}
+
+		orch, err := NewOrchestrator(OrchestratorOptions{
+			Store:        store,
+			SessionStore: sessionStore,
+			Harness:      harness,
+		})
+		if err != nil {
+			t.Fatalf("NewOrchestrator: %v", err)
+		}
+
+		if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+			t.Fatalf("reconcileWorkingRun: %v", err)
+		}
+
+		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if gotRun.Phase != state.PhaseNoImprovement {
+			t.Fatalf("expected phase %s, got %s", state.PhaseNoImprovement, gotRun.Phase)
+		}
+
+		// Handle map must be empty after terminal transition
+		if count := harness.TrackedSandboxesCount(); count != 0 {
+			t.Errorf("expected tracked sandboxes count 0 after terminal transition to NoImprovement, got %d", count)
+		}
+	})
+
+	// Case 2: Terminal transition to PhaseFailed
+	t.Run("Failed", func(t *testing.T) {
+		runID := "20261030T120000Z-term-fail"
+		sandboxName := "run-term-fail"
+		run := &state.Run{
+			ID:          runID,
+			Repo:        repo.Key(),
+			GoalName:    "goal-fail",
+			Phase:       state.PhaseWorking,
+			BaseCommit:  "base-sha",
+			SandboxName: sandboxName,
+		}
+		if err := store.PutRun(ctx, run); err != nil {
+			t.Fatalf("PutRun: %v", err)
+		}
+
+		// Intentionally do not create sandbox so it fails with expired/deleted
+		harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
+		orch, err := NewOrchestrator(OrchestratorOptions{
+			Store:        store,
+			SessionStore: sessionStore,
+			Harness:      harness,
+		})
+		if err != nil {
+			t.Fatalf("NewOrchestrator: %v", err)
+		}
+
+		if _, err := reconcileWorkingRun(ctx, orch, Request{Repo: repo.Key(), RunID: runID}); err == nil {
+			t.Logf("reconcileWorkingRun completed (errors handled)")
+		}
+
+		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if gotRun.Phase != state.PhaseFailed {
+			t.Fatalf("expected phase %s, got %s", state.PhaseFailed, gotRun.Phase)
+		}
+
+		// Handle map must be empty after terminal transition
+		if count := harness.TrackedSandboxesCount(); count != 0 {
+			t.Errorf("expected tracked sandboxes count 0 after terminal transition to Failed, got %d", count)
+		}
+	})
+}
+
+func TestOrchestrator_TurnOutcome_ConsumedOnceNotTwice(t *testing.T) {
+	ctx := t.Context()
+	store := state.NewFileStore(t.TempDir())
+	sessionStore := session.NewFileStore(t.TempDir())
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-consumed-once"
+	sandboxName := "run-consumed-once"
+	run := &state.Run{
+		ID:          runID,
+		Repo:        repo.Key(),
+		GoalName:    "goal-consume",
+		Phase:       state.PhaseWorking,
+		BaseCommit:  "base-sha",
+		SandboxName: sandboxName,
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: sandboxName, Namespace: "ao-sandboxes"},
+		Spec:       sandboxv1beta1.SandboxSpec{Lifecycle: sandboxv1beta1.Lifecycle{ShutdownTime: &metav1.Time{Time: time.Now().Add(5 * time.Minute)}, ShutdownPolicy: &policy}},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating sandbox: %v", err)
+	}
+
+	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        func() time.Time { return fixedTime },
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	// Pre-store an outcome for the run
+	orch.storeTurnOutcome(runID, turnOutcome{
+		Err:      nil,
+		Finished: fixedTime,
+	})
+
+	// Pass 1: Reconcile consumes the outcome and moves run to NoImprovement
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile pass 1: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseNoImprovement {
+		t.Fatalf("expected phase %s, got %s", state.PhaseNoImprovement, gotRun.Phase)
+	}
+
+	// Verify outcome was removed upon consumption
+	if _, ok := orch.popTurnOutcome(runID); ok {
+		t.Fatal("expected turn outcome to be deleted once consumed, but was still present")
+	}
+
+	// Pass 2: Reconcile again with no outcome stored
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("orch.Reconcile pass 2: %v", err)
+	}
+
+	// Outcome was not consumed twice (map is still empty)
+	if _, ok := orch.popTurnOutcome(runID); ok {
+		t.Fatal("outcome appeared again after pass 2")
 	}
 }

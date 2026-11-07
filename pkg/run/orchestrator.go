@@ -122,6 +122,14 @@ type OrchestratorOptions struct {
 	ForgeFor func(repoURL string) (forge.Forge, error)
 }
 
+type turnOutcome struct {
+	Err      error
+	Finished time.Time
+	PRTitle  string
+	PRBody   string
+	Summary  string
+}
+
 // Orchestrator reconciles runs in phase Pending and Working using a controller-runtime controller.
 type Orchestrator struct {
 	store             state.Store
@@ -143,6 +151,12 @@ type Orchestrator struct {
 
 	activeRunsMu sync.Mutex
 	activeRuns   map[string]bool
+
+	turnOutcomesMu sync.Mutex
+	turnOutcomes   map[string]turnOutcome
+
+	managerCtxMu sync.Mutex
+	managerCtx   context.Context
 }
 
 var _ reconcile.TypedReconciler[Request] = (*Orchestrator)(nil)
@@ -236,6 +250,7 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		forgeFor:          opts.ForgeFor,
 		notifyCh:          make(chan event.TypedGenericEvent[Request], 1024),
 		activeRuns:        make(map[string]bool),
+		turnOutcomes:      make(map[string]turnOutcome),
 	}
 	orch.statusPublisher = newHeroRunStatusPublisher(opts.KubeClient, opts.Store, clock, interval, namespace, orch.publishHeroRun)
 	return orch, nil
@@ -397,6 +412,9 @@ func (s *sandboxSource) mapSandboxToRequest(ctx context.Context, sb *sandboxv1be
 // Start implements manager.Runnable. On manager startup it calls Resume,
 // which enqueues all non-terminal runs. It then blocks until ctx is cancelled.
 func (o *Orchestrator) Start(ctx context.Context) error {
+	o.managerCtxMu.Lock()
+	o.managerCtx = ctx
+	o.managerCtxMu.Unlock()
 	if o.kubeClient == nil {
 		o.logNoKubeClient.Do(func() {
 			scoped.Log(ctx).Info("HeroRun publishing skipped: no Kubernetes client configured")
@@ -978,6 +996,48 @@ func (o *Orchestrator) setRunActive(runID string, active bool) bool {
 	return true
 }
 
+func (o *Orchestrator) isRunActive(runID string) bool {
+	o.activeRunsMu.Lock()
+	defer o.activeRunsMu.Unlock()
+	return o.activeRuns[runID]
+}
+
+func (o *Orchestrator) storeTurnOutcome(runID string, outcome turnOutcome) {
+	o.turnOutcomesMu.Lock()
+	defer o.turnOutcomesMu.Unlock()
+	o.turnOutcomes[runID] = outcome
+}
+
+func (o *Orchestrator) popTurnOutcome(runID string) (turnOutcome, bool) {
+	o.turnOutcomesMu.Lock()
+	defer o.turnOutcomesMu.Unlock()
+	outcome, ok := o.turnOutcomes[runID]
+	if ok {
+		delete(o.turnOutcomes, runID)
+	}
+	return outcome, ok
+}
+
+func (o *Orchestrator) getWorkerContext(ctx context.Context) context.Context {
+	o.managerCtxMu.Lock()
+	base := o.managerCtx
+	o.managerCtxMu.Unlock()
+	if base == nil {
+		base = context.WithoutCancel(ctx)
+	}
+	return scoped.WithLog(base, scoped.Log(ctx))
+}
+
+func (o *Orchestrator) releaseSandbox(sandboxName string) {
+	if o.harness == nil || sandboxName == "" {
+		return
+	}
+	sb := o.harness.GetOrAttachSandbox(sandboxName)
+	if sb != nil {
+		o.harness.ReleaseSandbox(sb)
+	}
+}
+
 // putRun writes a run record to the state store and updates HeroRun status:
 // critical transitions are published synchronously via PublishNow, while
 // progress updates are marked dirty and coalesced by the publisher loop.
@@ -1077,29 +1137,60 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 		return nil
 	}
 
-	if !o.setRunActive(run.ID, true) {
+	if outcome, ok := o.popTurnOutcome(run.ID); ok {
+		return o.handleTurnOutcome(ctx, repo, run, outcome)
+	}
+
+	if o.isRunActive(run.ID) {
 		log.V(2).Info("run is already actively executing a session", "run", run.ID)
 		return nil
 	}
-	defer o.setRunActive(run.ID, false)
+
+	o.startTurn(ctx, repo, run)
+	return nil
+}
+
+func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *state.Run) {
+	if !o.setRunActive(run.ID, true) {
+		return
+	}
+
+	workerCtx := o.getWorkerContext(ctx)
+
+	go func() {
+		defer o.setRunActive(run.ID, false)
+		outcome := o.runTurnWorker(workerCtx, repo, run)
+		o.storeTurnOutcome(run.ID, outcome)
+		o.Notify(repo.Key(), run.ID)
+	}()
+}
+
+func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run *state.Run) turnOutcome {
+	log := scoped.Log(ctx)
 
 	sandboxName := run.SandboxName
 	if sandboxName == "" {
-		return o.failRunWithEvent(ctx, repo, run, "sandbox name is empty for working run")
+		return turnOutcome{
+			Err:      errors.New("sandbox name is empty for working run"),
+			Finished: o.clock().UTC(),
+		}
 	}
 
 	sb := o.harness.GetOrAttachSandbox(sandboxName)
 	if sb == nil {
-		return o.failRunWithEvent(ctx, repo, run, "failed to get sandbox handle")
+		return turnOutcome{
+			Err:      errors.New("failed to get sandbox handle"),
+			Finished: o.clock().UTC(),
+		}
 	}
 
 	// Verify sandbox exists in Kubernetes and has not expired.
 	// If expired or deleted, fail the run with a clear event.
 	if err := sb.CheckAliveAndExtendLifecycle(ctx, o.clock().UTC(), session.SandboxInactivityTimeout); err != nil {
-		if ctx.Err() != nil {
-			return nil
+		return turnOutcome{
+			Err:      fmt.Errorf("sandbox %s expired or deleted: %w", sandboxName, err),
+			Finished: o.clock().UTC(),
 		}
-		return o.failRunWithEvent(ctx, repo, run, fmt.Sprintf("sandbox %s expired or deleted: %v", sandboxName, err))
 	}
 
 	// Assign session ID if not already assigned and persist in run.json
@@ -1108,7 +1199,10 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 		sessionID = generateSessionID(run.ID)
 		run.SessionID = sessionID
 		if err := o.putRun(ctx, repo, run, run.Phase); err != nil {
-			return fmt.Errorf("updating run with session ID: %w", err)
+			return turnOutcome{
+				Err:      fmt.Errorf("updating run with session ID: %w", err),
+				Finished: o.clock().UTC(),
+			}
 		}
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
 			Time:    o.clock().UTC(),
@@ -1138,10 +1232,16 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 				CreatedAt: o.clock().UTC(),
 			})
 			if err != nil {
-				return fmt.Errorf("creating session %s: %w", sessionID, err)
+				return turnOutcome{
+					Err:      fmt.Errorf("creating session %s: %w", sessionID, err),
+					Finished: o.clock().UTC(),
+				}
 			}
 		} else {
-			return fmt.Errorf("loading session %s: %w", sessionID, err)
+			return turnOutcome{
+				Err:      fmt.Errorf("loading session %s: %w", sessionID, err),
+				Finished: o.clock().UTC(),
+			}
 		}
 	}
 
@@ -1156,7 +1256,10 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 			Role:    "system",
 			Content: &sysPrompt,
 		}); err != nil {
-			return fmt.Errorf("seeding system prompt: %w", err)
+			return turnOutcome{
+				Err:      fmt.Errorf("seeding system prompt: %w", err),
+				Finished: o.clock().UTC(),
+			}
 		}
 	}
 
@@ -1199,9 +1302,33 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 	harness := o.harness.WithMaxTurns(o.maxTurns).WithExtraTools(finishTool, prTool)
 	turnErr := harness.RunTurn(sessionCtx, sess, "Please work on the goal.", events)
 
+	heartbeatMu.Lock()
+	hbErr := heartbeatErr
+	heartbeatMu.Unlock()
+	if hbErr != nil && (turnErr == nil || errors.Is(turnErr, context.Canceled)) {
+		turnErr = hbErr
+	}
+	if errors.Is(hbErr, session.ErrSandboxExpired) {
+		turnErr = session.ErrSandboxExpired
+	}
+
+	return turnOutcome{
+		Err:      turnErr,
+		Finished: o.clock().UTC(),
+		PRTitle:  prTool.Title,
+		PRBody:   prTool.Body,
+		Summary:  finishTool.Summary,
+	}
+}
+
+func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, run *state.Run, outcome turnOutcome) error {
+	log := scoped.Log(ctx)
+
+	turnErr := outcome.Err
+
 	if errors.Is(turnErr, session.ErrPullRequestRequested) {
-		run.PRTitle = prTool.Title
-		run.PRBody = prTool.Body
+		run.PRTitle = outcome.PRTitle
+		run.PRBody = outcome.PRBody
 		prev := run.Phase
 		now := o.clock().UTC()
 		run.SetPhase(state.PhaseSelecting, now)
@@ -1216,16 +1343,22 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 		}); err != nil {
 			log.Error(err, "failed to append pull_request_requested event", "run", run.ID)
 		}
+		o.releaseSandbox(run.SandboxName)
 		o.Notify(repo.Key(), run.ID)
 		return nil
 	}
 
+	var sb *session.Sandbox
+	if o.harness != nil && run.SandboxName != "" {
+		sb = o.harness.GetOrAttachSandbox(run.SandboxName)
+	}
+
 	if errors.Is(turnErr, session.ErrSessionFinished) {
-		run.Summary = finishTool.Summary
+		run.Summary = outcome.Summary
 		o.finishRun(ctx, repo, run, runEnd{
 			Phase:   state.PhaseNoImprovement,
 			Kind:    "finished",
-			Message: finishTool.Summary,
+			Message: outcome.Summary,
 			Sandbox: sb,
 		})
 		return nil
@@ -1241,18 +1374,32 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 		return nil
 	}
 
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || errors.Is(turnErr, context.Canceled) {
 		return nil
 	}
 
-	heartbeatMu.Lock()
-	hbErr := heartbeatErr
-	heartbeatMu.Unlock()
-	if errors.Is(turnErr, session.ErrSandboxExpired) || errors.Is(hbErr, session.ErrSandboxExpired) {
-		return o.failRunWithEvent(ctx, repo, run, "sandbox expired or was deleted during session")
+	if errors.Is(turnErr, session.ErrSandboxExpired) {
+		msg := "sandbox expired or was deleted during session"
+		if strings.Contains(turnErr.Error(), "expired or deleted") {
+			msg = turnErr.Error()
+		}
+		o.finishRun(ctx, repo, run, runEnd{
+			Phase:   state.PhaseFailed,
+			Kind:    "failed",
+			Message: msg,
+			Sandbox: sb,
+		})
+		return errors.New(msg)
 	}
 
-	return o.failRunWithEvent(ctx, repo, run, fmt.Sprintf("session error: %v", turnErr))
+	errMsg := fmt.Sprintf("session error: %v", turnErr)
+	o.finishRun(ctx, repo, run, runEnd{
+		Phase:   state.PhaseFailed,
+		Kind:    "failed",
+		Message: errMsg,
+		Sandbox: sb,
+	})
+	return errors.New(errMsg)
 }
 
 func (o *Orchestrator) reconcileSelecting(ctx context.Context, repo *state.Repo, run *state.Run) (reconcile.Result, error) {
