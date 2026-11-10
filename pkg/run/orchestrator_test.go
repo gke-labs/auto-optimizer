@@ -2189,6 +2189,18 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 			t.Errorf("unexpected failed event recorded on context cancellation: %+v", e)
 		}
 	}
+
+	// Later reconcile pass consuming leftover turn outcome must also leave run Working
+	if _, err := orch.Reconcile(t.Context(), Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("Reconcile after cancellation: %v", err)
+	}
+	gotRunAfter, err := store.GetRun(t.Context(), repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun after outcome: %v", err)
+	}
+	if gotRunAfter.Phase != state.PhaseWorking {
+		t.Errorf("expected phase %s after consuming outcome, got %s", state.PhaseWorking, gotRunAfter.Phase)
+	}
 }
 
 func TestOrchestrator_WorkingRunEnqueuedOnStart(t *testing.T) {
@@ -6603,5 +6615,217 @@ func TestOrchestrator_Working_PendingOutcomeConsumedBeforeDeadline(t *testing.T)
 		if e.Kind == "deadline_exceeded" {
 			t.Errorf("did not expect deadline_exceeded event when turn outcome was waiting")
 		}
+	}
+}
+
+type recordingChatClient struct {
+	mu   sync.Mutex
+	reqs []llm.ChatCompletionRequest
+}
+
+func (r *recordingChatClient) CreateChatCompletion(ctx context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	r.mu.Lock()
+	r.reqs = append(r.reqs, req)
+	r.mu.Unlock()
+	done := "done"
+	return &llm.ChatCompletionResponse{
+		Choices: []llm.Choice{{Message: llm.Message{Role: "assistant", Content: &done}}},
+	}, nil
+}
+
+func (r *recordingChatClient) getRequests() []llm.ChatCompletionRequest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]llm.ChatCompletionRequest, len(r.reqs))
+	copy(out, r.reqs)
+	return out
+}
+
+func TestOrchestrator_Working_Resume_LiveSandboxStartsTurnWithPleaseContinue(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261030T120000Z-resume-live", "run-resume-live"
+	startTime := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	deadline := startTime.Add(10 * time.Minute)
+
+	recordingLLM := &recordingChatClient{}
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, &deadline, recordingLLM)
+
+	sessionID := generateSessionID(runID)
+	run.SessionID = sessionID
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	sess, err := harness.NewSession(ctx, sessionStore, sessionID, session.Metadata{
+		CreatedAt: startTime,
+	})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	sysPrompt := "system prompt"
+	firstUserMsg := "Please work on the goal."
+	assistantMsg := "Starting work..."
+	if err := sess.AddMessages(ctx,
+		llm.Message{Role: "system", Content: &sysPrompt},
+		llm.Message{Role: "user", Content: &firstUserMsg},
+		llm.Message{Role: "assistant", Content: &assistantMsg},
+	); err != nil {
+		t.Fatalf("AddMessages: %v", err)
+	}
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store: store, SessionStore: sessionStore, Harness: harness,
+		Clock: func() time.Time { return startTime },
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	deadlineWait := time.Now().Add(5 * time.Second)
+	for orch.isRunActive(runID) {
+		if time.Now().After(deadlineWait) {
+			t.Fatal("timed out waiting for worker to finish")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	reqs := recordingLLM.getRequests()
+	if len(reqs) == 0 {
+		t.Fatal("expected at least one LLM call, got 0")
+	}
+
+	var newTurnUserMsg *llm.Message
+	for _, m := range reqs[0].Messages {
+		if m.Role == "user" && m.Content != nil && *m.Content != firstUserMsg {
+			newTurnUserMsg = &m
+			break
+		}
+	}
+	if newTurnUserMsg == nil || *newTurnUserMsg.Content != "Please continue." {
+		var gotContent string
+		if newTurnUserMsg != nil && newTurnUserMsg.Content != nil {
+			gotContent = *newTurnUserMsg.Content
+		}
+		t.Errorf("expected new turn user message %q, got %q (messages: %+v)", "Please continue.", gotContent, reqs[0].Messages)
+	}
+}
+
+func TestOrchestrator_Working_EmptySessionStartsTurnWithPleaseWorkOnGoal(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261030T120000Z-empty-sess", "run-empty-sess"
+	startTime := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	deadline := startTime.Add(10 * time.Minute)
+
+	recordingLLM := &recordingChatClient{}
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, &deadline, recordingLLM)
+
+	// SessionID is set, but session in sessionStore is empty (simulating crash before messages were saved)
+	sessionID := generateSessionID(runID)
+	run.SessionID = sessionID
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store: store, SessionStore: sessionStore, Harness: harness,
+		Clock: func() time.Time { return startTime },
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	deadlineWait := time.Now().Add(5 * time.Second)
+	for orch.isRunActive(runID) {
+		if time.Now().After(deadlineWait) {
+			t.Fatal("timed out waiting for worker to finish")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	reqs := recordingLLM.getRequests()
+	if len(reqs) == 0 {
+		t.Fatal("expected at least one LLM call, got 0")
+	}
+
+	// For an empty session, the input must be "Please work on the goal." and system prompt must be seeded
+	hasSystemPrompt := false
+	var userMsg *llm.Message
+	for _, m := range reqs[0].Messages {
+		if m.Role == "system" {
+			hasSystemPrompt = true
+		}
+		if m.Role == "user" && m.Content != nil {
+			userMsg = &m
+		}
+	}
+	if !hasSystemPrompt {
+		t.Errorf("expected system prompt to be seeded for empty session")
+	}
+	if userMsg == nil || *userMsg.Content != "Please work on the goal." {
+		var got string
+		if userMsg != nil && userMsg.Content != nil {
+			got = *userMsg.Content
+		}
+		t.Errorf("expected user message %q, got %q", "Please work on the goal.", got)
+	}
+}
+
+func TestOrchestrator_Working_Resume_SandboxDeletedFailsSandboxExpired(t *testing.T) {
+	ctx := t.Context()
+	runID, sbName := "20261030T120000Z-resume-deleted", "run-resume-deleted"
+	startTime := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	deadline := startTime.Add(10 * time.Minute)
+
+	store, sessionStore, repo, _, harness, agentsCS := setupWorkingTestRun(t, runID, sbName, &deadline, &llm.ElizaClient{})
+
+	if err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Delete(ctx, sbName, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("Delete sandbox: %v", err)
+	}
+
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store: store, SessionStore: sessionStore, Harness: harness,
+		Clock: func() time.Time { return startTime },
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+
+	if _, err := orch.Reconcile(ctx, Request{Repo: repo.Key(), RunID: runID}); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseFailed {
+		t.Fatalf("expected phase Failed, got %s", gotRun.Phase)
+	}
+
+	events, err := store.ReadEvents(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("ReadEvents: %v", err)
+	}
+	var foundEvent bool
+	for _, e := range events {
+		if e.Phase == state.PhaseFailed && e.Kind == "sandbox_expired" {
+			foundEvent = true
+			break
+		}
+	}
+	if !foundEvent {
+		t.Errorf("expected sandbox_expired event on failure, got events: %+v", events)
+	}
+
+	if orch.isRunActive(runID) {
+		t.Errorf("expected worker not to be started for deleted sandbox")
 	}
 }

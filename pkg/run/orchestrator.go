@@ -1113,6 +1113,12 @@ func (o *Orchestrator) isRunActive(runID string) bool {
 	return o.activeRuns[runID]
 }
 
+func (o *Orchestrator) isManagerStopped() bool {
+	o.managerCtxMu.Lock()
+	defer o.managerCtxMu.Unlock()
+	return o.managerCtx != nil && o.managerCtx.Err() != nil
+}
+
 func (o *Orchestrator) storeTurnOutcome(runID string, outcome turnOutcome) {
 	o.turnOutcomesMu.Lock()
 	defer o.turnOutcomesMu.Unlock()
@@ -1261,7 +1267,7 @@ func runStartTime(run *state.Run) time.Time {
 func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state.Run) (reconcile.Result, error) {
 	log := scoped.Log(ctx)
 
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || o.isManagerStopped() {
 		return reconcile.Result{}, nil
 	}
 
@@ -1330,6 +1336,34 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 
 		log.V(2).Info("run is already actively executing a session", "run", run.ID)
 		return reconcile.Result{RequeueAfter: requeueAfter}, nil
+	}
+
+	if run.SandboxName == "" {
+		o.finishRun(ctx, repo, run, runEnd{
+			Phase:   state.PhaseFailed,
+			Kind:    "sandbox_expired",
+			Message: "sandbox name is empty for working run",
+		})
+		return reconcile.Result{}, nil
+	}
+
+	if o.harness != nil {
+		sb := o.harness.GetOrAttachSandbox(run.SandboxName)
+		if sb != nil {
+			if err := sb.CheckAlive(ctx, now); err != nil {
+				if errors.Is(err, session.ErrSandboxExpired) {
+					msg := fmt.Sprintf("sandbox %s expired or deleted: %v", run.SandboxName, err)
+					o.finishRun(ctx, repo, run, runEnd{
+						Phase:   state.PhaseFailed,
+						Kind:    "sandbox_expired",
+						Message: msg,
+						Sandbox: sb,
+					})
+					return reconcile.Result{}, nil
+				}
+				return reconcile.Result{}, fmt.Errorf("checking sandbox %s: %w", run.SandboxName, err)
+			}
+		}
 	}
 
 	o.startTurn(ctx, repo, run)
@@ -1432,7 +1466,8 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 	sess.FailOnSandboxExpiry = true
 
 	// Seed system prompt if new session
-	if len(sess.Messages()) == 0 {
+	isNewSession := len(sess.Messages()) == 0
+	if isNewSession {
 		sysPrompt := buildSystemPrompt(o.harness.RunOptions().SystemPrompt, repo, run, goalBody)
 		if err := sess.AddMessages(ctx, llm.Message{
 			Role:    "system",
@@ -1459,7 +1494,11 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 		Branch:     run.BranchName(),
 	})
 	harness := o.harness.WithMaxTurns(o.maxTurns).WithExtraTools(finishTool, prTool)
-	turnErr := harness.RunTurn(sessionCtx, sess, "Please work on the goal.", events)
+	input := "Please continue."
+	if isNewSession {
+		input = "Please work on the goal."
+	}
+	turnErr := harness.RunTurn(sessionCtx, sess, input, events)
 
 	return turnOutcome{
 		Err:      turnErr,
@@ -1527,7 +1566,7 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 		return nil
 	}
 
-	if ctx.Err() != nil || errors.Is(turnErr, context.Canceled) {
+	if ctx.Err() != nil || o.isManagerStopped() || errors.Is(turnErr, context.Canceled) || status.Code(turnErr) == codes.Canceled {
 		return nil
 	}
 
