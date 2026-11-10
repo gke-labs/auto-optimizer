@@ -64,7 +64,6 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
-	"github.com/go-logr/logr"
 )
 
 type mockProcessServer struct {
@@ -2765,77 +2764,188 @@ func TestOrchestrator_Preparing_WatchFailureConditionFailsRun(t *testing.T) {
 	}
 }
 
-func TestSandboxSource_MapSandboxToRequest(t *testing.T) {
+func TestOrchestrator_RequestsForSandbox(t *testing.T) {
 	ctx := t.Context()
-	s := &sandboxSource{
-		log: logr.Discard(),
+
+	scheme, err := NewScheme()
+	if err != nil {
+		t.Fatalf("NewScheme: %v", err)
 	}
 
-	tests := []struct {
-		name     string
-		repoStr  string
-		runID    string
-		wantRepo state.RepoKey
-		wantNil  bool
-	}{
-		{
-			name:     "remote repo key",
-			repoStr:  "github.com/gke-labs/auto-optimizer",
-			runID:    "run-1",
-			wantRepo: state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"},
+	const ns = "ao-sandboxes"
+	isController := true
+
+	hr := &herorunv1alpha1.HeroRun{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "herorun-1",
+			Namespace: ns,
+			Labels: map[string]string{
+				LabelRun: "run-hero",
+			},
+			Annotations: map[string]string{
+				AnnotationRepo: "github.com/gke-labs/auto-optimizer",
+			},
 		},
-		{
-			name:     "local repo key with underscore owner",
-			repoStr:  "local/_/hello-repo",
-			runID:    "run-2",
-			wantRepo: state.RepoKey{Host: "local", Owner: "_", Name: "hello-repo"},
-		},
-		{
-			name:    "invalid repo key format",
-			repoStr: "invalid-format",
-			runID:   "run-3",
-			wantNil: true,
-		},
-		{
-			name:    "missing annotation",
-			repoStr: "",
-			runID:   "run-4",
-			wantNil: true,
+		Spec: herorunv1alpha1.HeroRunSpec{
+			Repository: "https://github.com/gke-labs/auto-optimizer",
+			Goal:       "optimize",
+			RunID:      "run-hero",
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var sb *sandboxv1beta1.Sandbox
-			if tt.repoStr != "" {
-				sb = &sandboxv1beta1.Sandbox{
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(hr).Build()
+	orch := &Orchestrator{kubeClient: fakeClient}
+
+	t.Run("owned sandbox maps through HeroRun", func(t *testing.T) {
+		sb := &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "sb-owned",
+				Namespace: ns,
+				Labels: map[string]string{
+					LabelRun: "sb-run-id",
+				},
+				Annotations: map[string]string{
+					AnnotationRepo: "local/_/sb-repo",
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: herorunv1alpha1.GroupVersion.String(),
+						Kind:       "HeroRun",
+						Name:       "herorun-1",
+						UID:        "uid-1",
+						Controller: &isController,
+					},
+				},
+			},
+		}
+
+		got := orch.requestsForSandbox(ctx, sb)
+		if len(got) != 1 {
+			t.Fatalf("expected 1 request, got %d", len(got))
+		}
+		wantRepo := state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
+		if got[0].RunID != "run-hero" {
+			t.Errorf("got RunID = %q, want %q", got[0].RunID, "run-hero")
+		}
+		if got[0].Repo != wantRepo {
+			t.Errorf("got Repo = %+v, want %+v", got[0].Repo, wantRepo)
+		}
+	})
+
+	t.Run("sandbox without owner maps from own label and annotation", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			repoStr  string
+			runID    string
+			wantRepo state.RepoKey
+			wantNil  bool
+		}{
+			{name: "remote repo key", repoStr: "github.com/gke-labs/auto-optimizer", runID: "run-1", wantRepo: state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}},
+			{name: "local repo key with underscore owner", repoStr: "local/_/hello-repo", runID: "run-2", wantRepo: state.RepoKey{Host: "local", Owner: "_", Name: "hello-repo"}},
+			{name: "invalid repo key format", repoStr: "invalid-format", runID: "run-3", wantNil: true},
+			{name: "missing annotation", repoStr: "", runID: "run-4", wantNil: true},
+			{name: "missing run label", repoStr: "github.com/gke-labs/auto-optimizer", runID: "", wantNil: true},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				sb := &sandboxv1beta1.Sandbox{
 					ObjectMeta: metav1.ObjectMeta{
-						Annotations: map[string]string{
-							AnnotationRepo: tt.repoStr,
-						},
+						Name:      "sb-unowned",
+						Namespace: ns,
 					},
 				}
-			} else {
-				sb = &sandboxv1beta1.Sandbox{}
-			}
-			got := s.mapSandboxToRequest(ctx, sb, tt.runID)
-			if tt.wantNil {
-				if got != nil {
-					t.Fatalf("expected nil request, got %+v", got)
+				if tt.runID != "" {
+					sb.Labels = map[string]string{LabelRun: tt.runID}
 				}
-				return
-			}
-			if got == nil {
-				t.Fatalf("expected non-nil request")
-			}
-			if got.RunID != tt.runID {
-				t.Errorf("got RunID = %q, want %q", got.RunID, tt.runID)
-			}
-			if got.Repo != tt.wantRepo {
-				t.Errorf("got Repo = %+v, want %+v", got.Repo, tt.wantRepo)
-			}
-		})
-	}
+				if tt.repoStr != "" {
+					sb.Annotations = map[string]string{AnnotationRepo: tt.repoStr}
+				}
+				got := orch.requestsForSandbox(ctx, sb)
+				if tt.wantNil {
+					if len(got) != 0 {
+						t.Fatalf("expected empty requests, got %+v", got)
+					}
+					return
+				}
+				if len(got) != 1 {
+					t.Fatalf("expected 1 request, got %d", len(got))
+				}
+				if got[0].RunID != tt.runID {
+					t.Errorf("got RunID = %q, want %q", got[0].RunID, tt.runID)
+				}
+				if got[0].Repo != tt.wantRepo {
+					t.Errorf("got Repo = %+v, want %+v", got[0].Repo, tt.wantRepo)
+				}
+			})
+		}
+	})
+
+	t.Run("owner present but HeroRun missing maps to nothing", func(t *testing.T) {
+		sb := &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "sb-missing-owner",
+				Namespace: ns,
+				Labels: map[string]string{
+					LabelRun: "run-sb",
+				},
+				Annotations: map[string]string{
+					AnnotationRepo: "github.com/gke-labs/auto-optimizer",
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: herorunv1alpha1.GroupVersion.String(),
+						Kind:       "HeroRun",
+						Name:       "herorun-nonexistent",
+						UID:        "uid-missing",
+						Controller: &isController,
+					},
+				},
+			},
+		}
+
+		got := orch.requestsForSandbox(ctx, sb)
+		if len(got) != 0 {
+			t.Fatalf("expected 0 requests for missing HeroRun owner, got %+v", got)
+		}
+	})
+
+	t.Run("nil client falls back", func(t *testing.T) {
+		nilClientOrch := &Orchestrator{kubeClient: nil}
+		sb := &sandboxv1beta1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "sb-nil-client",
+				Namespace: ns,
+				Labels: map[string]string{
+					LabelRun: "run-nil-client",
+				},
+				Annotations: map[string]string{
+					AnnotationRepo: "github.com/gke-labs/auto-optimizer",
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion: herorunv1alpha1.GroupVersion.String(),
+						Kind:       "HeroRun",
+						Name:       "herorun-1",
+						UID:        "uid-1",
+						Controller: &isController,
+					},
+				},
+			},
+		}
+
+		got := nilClientOrch.requestsForSandbox(ctx, sb)
+		if len(got) != 1 {
+			t.Fatalf("expected 1 request with nil client fallback, got %d", len(got))
+		}
+		wantRepo := state.RepoKey{Host: "github.com", Owner: "gke-labs", Name: "auto-optimizer"}
+		if got[0].RunID != "run-nil-client" {
+			t.Errorf("got RunID = %q, want %q", got[0].RunID, "run-nil-client")
+		}
+		if got[0].Repo != wantRepo {
+			t.Errorf("got Repo = %+v, want %+v", got[0].Repo, wantRepo)
+		}
+	})
 }
 
 func TestOrchestrator_PublishHeroRun_LeavesPending(t *testing.T) {
