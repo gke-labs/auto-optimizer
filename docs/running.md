@@ -153,6 +153,8 @@ You will see several event kinds in the run event log:
 - `verify_failed`: the candidate failed the verification command or the command timed out.
 - `no_changes`: the agent made no git commits against the base commit.
 - `refused`: the agent modified files under `.goals/`.
+- `deadline_exceeded`: the run reached its `budget.maxDuration` or the `--max-run-duration` default and the orchestrator ended it.
+- `sandbox_deleted`: the Sandbox disappeared or failed while the session was running.
 - `branch_pushed`: the control plane pushed the candidate branch to the forge.
 - `pull_request_opened`: the control plane opened a pull request on the repository.
 
