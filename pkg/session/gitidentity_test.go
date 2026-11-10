@@ -92,3 +92,38 @@ func TestConfigureGitIdentity(t *testing.T) {
 		})
 	}
 }
+
+func TestGitOptions(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		var opts GitOptions
+		opts.InitDefaults()
+		if opts.Author != DefaultGitAuthor {
+			t.Errorf("Author = %q, want %q", opts.Author, DefaultGitAuthor)
+		}
+	})
+
+	t.Run("custom author preserved", func(t *testing.T) {
+		opts := GitOptions{Author: "Custom <custom@example.com>"}
+		opts.InitDefaults()
+		if opts.Author != "Custom <custom@example.com>" {
+			t.Errorf("Author = %q, want 'Custom <custom@example.com>'", opts.Author)
+		}
+	})
+
+	t.Run("validate", func(t *testing.T) {
+		var nilOpts *GitOptions
+		if err := nilOpts.Validate(); err == nil {
+			t.Error("expected error for nil options, got nil")
+		}
+
+		valid := GitOptions{Author: "Bot <bot@example.org>"}
+		if err := valid.Validate(); err != nil {
+			t.Errorf("unexpected error for valid author: %v", err)
+		}
+
+		invalid := GitOptions{Author: "invalid-author<"}
+		if err := invalid.Validate(); err == nil {
+			t.Error("expected error for invalid author, got nil")
+		}
+	})
+}

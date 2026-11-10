@@ -606,3 +606,83 @@ func TestRunGetCommand_Execution(t *testing.T) {
 		t.Errorf("expected JSON to contain sandboxName and 'run-20261030t100000z-1234', got:\n%s", jsonOutput)
 	}
 }
+
+func TestServeFlags_DirectBinding(t *testing.T) {
+	var opts serveOptions
+	cmd := newServeCommandWithOptions(&opts)
+
+	args := []string{
+		"--max-turns", "42",
+		"--max-concurrent-runs", "8",
+		"--git-author", "Test Author <test@example.com>",
+		"--public-url", "https://custom.example.com",
+		"--ready-timeout", "5m",
+		"--verify-timeout", "15m",
+		"--max-run-duration", "2h",
+		"--namespace", "custom-ns",
+		"--image", "custom-img:tag",
+		"--homedir", "/custom/home",
+		"--tool-timeout", "4m",
+	}
+
+	if err := cmd.ParseFlags(args); err != nil {
+		t.Fatalf("ParseFlags: %v", err)
+	}
+
+	// Verify values reached the option types directly without intermediate copies
+	if opts.orchestrator.MaxTurns != 42 {
+		t.Errorf("orchestrator.MaxTurns = %d, want 42", opts.orchestrator.MaxTurns)
+	}
+	if opts.orchestrator.MaxConcurrentRuns != 8 {
+		t.Errorf("orchestrator.MaxConcurrentRuns = %d, want 8", opts.orchestrator.MaxConcurrentRuns)
+	}
+	if opts.git.Author != "Test Author <test@example.com>" {
+		t.Errorf("git.Author = %q, want 'Test Author <test@example.com>'", opts.git.Author)
+	}
+	if opts.orchestrator.PublicURL != "https://custom.example.com" {
+		t.Errorf("orchestrator.PublicURL = %q, want 'https://custom.example.com'", opts.orchestrator.PublicURL)
+	}
+	if opts.orchestrator.ReadyTimeout != 5*time.Minute {
+		t.Errorf("orchestrator.ReadyTimeout = %v, want 5m", opts.orchestrator.ReadyTimeout)
+	}
+	if opts.orchestrator.VerifyTimeout != 15*time.Minute {
+		t.Errorf("orchestrator.VerifyTimeout = %v, want 15m", opts.orchestrator.VerifyTimeout)
+	}
+	if opts.orchestrator.DefaultMaxDuration != 2*time.Hour {
+		t.Errorf("orchestrator.DefaultMaxDuration = %v, want 2h", opts.orchestrator.DefaultMaxDuration)
+	}
+	if opts.sandbox.Namespace != "custom-ns" {
+		t.Errorf("sandbox.Namespace = %q, want 'custom-ns'", opts.sandbox.Namespace)
+	}
+	if opts.sandbox.Image != "custom-img:tag" {
+		t.Errorf("sandbox.Image = %q, want 'custom-img:tag'", opts.sandbox.Image)
+	}
+	if opts.sandbox.HomeDir != "/custom/home" {
+		t.Errorf("sandbox.HomeDir = %q, want '/custom/home'", opts.sandbox.HomeDir)
+	}
+	if opts.sandbox.ToolTimeout != 4*time.Minute {
+		t.Errorf("sandbox.ToolTimeout = %v, want 4m", opts.sandbox.ToolTimeout)
+	}
+}
+
+func TestServeSandboxEnvironmentOverrides(t *testing.T) {
+	t.Setenv("SANDBOX_NAMESPACE", "env-ns")
+	t.Setenv("SANDBOX_IMAGE", "env-img:v1")
+	t.Setenv("SANDBOX_HOME_DIR", "/env/home")
+
+	var opts serveOptions
+	cmd := newServeCommandWithOptions(&opts)
+	if err := cmd.ParseFlags([]string{}); err != nil {
+		t.Fatalf("ParseFlags: %v", err)
+	}
+
+	if opts.sandbox.Namespace != "env-ns" {
+		t.Errorf("sandbox.Namespace = %q, want 'env-ns'", opts.sandbox.Namespace)
+	}
+	if opts.sandbox.Image != "env-img:v1" {
+		t.Errorf("sandbox.Image = %q, want 'env-img:v1'", opts.sandbox.Image)
+	}
+	if opts.sandbox.HomeDir != "/env/home" {
+		t.Errorf("sandbox.HomeDir = %q, want '/env/home'", opts.sandbox.HomeDir)
+	}
+}

@@ -25,6 +25,7 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-logr/logr"
+	"github.com/spf13/pflag"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -164,6 +165,17 @@ func (o *OrchestratorOptions) InitDefaults() {
 	if o.DefaultMaxDuration == 0 {
 		o.DefaultMaxDuration = DefaultMaxDuration
 	}
+}
+
+// AddFlags binds orchestrator configuration flags to fs.
+func (o *OrchestratorOptions) AddFlags(fs *pflag.FlagSet) {
+	o.InitDefaults()
+	fs.IntVar(&o.MaxTurns, "max-turns", o.MaxTurns, "Maximum number of session turns before ending a run")
+	fs.IntVar(&o.MaxConcurrentRuns, "max-concurrent-runs", o.MaxConcurrentRuns, "Maximum number of concurrent runs reconciled")
+	fs.StringVar(&o.PublicURL, "public-url", o.PublicURL, "Public base URL of this server, used for links in pull request bodies, for example https://ao.example.com")
+	fs.DurationVar(&o.ReadyTimeout, "ready-timeout", o.ReadyTimeout, "Maximum duration to wait for a sandbox to become ready")
+	fs.DurationVar(&o.VerifyTimeout, "verify-timeout", o.VerifyTimeout, "Maximum duration for running a goal's verify command")
+	fs.DurationVar(&o.DefaultMaxDuration, "max-run-duration", o.DefaultMaxDuration, "Default maximum duration for a run when the goal does not specify budget.maxDuration")
 }
 
 // Validate reports any missing required dependencies or invalid option values.

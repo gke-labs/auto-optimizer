@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/mail"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -48,27 +47,37 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/web"
 )
 
-type serveFlags struct {
-	listen            string
-	http              string
-	namespace         string
-	toolset           string
-	image             string
-	homeDir           string
-	toolTimeout       time.Duration
-	stateDir          string
-	repos             []string
-	maxTurns          int
-	maxConcurrentRuns int
-	gitAuthor         string
-	publicURL         string
-	readyTimeout      time.Duration
-	verifyTimeout     time.Duration
-	maxRunDuration    time.Duration
+type serveOptions struct {
+	listen   string
+	http     string
+	toolset  string
+	stateDir string
+	repos    []string
+
+	sandbox      session.SandboxOptions
+	git          session.GitOptions
+	orchestrator run.OrchestratorOptions
 }
 
 func newServeCommand() *cobra.Command {
-	var flags serveFlags
+	var opts serveOptions
+	return newServeCommandWithOptions(&opts)
+}
+
+func newServeCommandWithOptions(opts *serveOptions) *cobra.Command {
+	opts.sandbox.InitDefaults()
+	if envNamespace := os.Getenv("SANDBOX_NAMESPACE"); envNamespace != "" {
+		opts.sandbox.Namespace = envNamespace
+	}
+	if envImage := os.Getenv("SANDBOX_IMAGE"); envImage != "" {
+		opts.sandbox.Image = envImage
+	}
+	if envHomeDir := os.Getenv("SANDBOX_HOME_DIR"); envHomeDir != "" {
+		opts.sandbox.HomeDir = envHomeDir
+	}
+
+	opts.git.InitDefaults()
+	opts.orchestrator.InitDefaults()
 
 	defaultListen := os.Getenv("AO_LISTEN")
 	if defaultListen == "" {
@@ -80,22 +89,10 @@ func newServeCommand() *cobra.Command {
 		defaultHTTP = "127.0.0.1:8080"
 	}
 
-	defaultNamespace := os.Getenv("SANDBOX_NAMESPACE")
-	if defaultNamespace == "" {
-		defaultNamespace = "ao-sandboxes"
-	}
-
 	defaultToolset := os.Getenv("TOOLSET")
 	if defaultToolset == "" {
 		defaultToolset = "basic"
 	}
-
-	defaultHomeDir := os.Getenv("SANDBOX_HOME_DIR")
-	if defaultHomeDir == "" {
-		defaultHomeDir = "/home/clawtainer"
-	}
-
-	defaultImage := os.Getenv("SANDBOX_IMAGE")
 
 	userHome, err := os.UserHomeDir()
 	if err != nil {
@@ -116,22 +113,22 @@ func newServeCommand() *cobra.Command {
 					return fmt.Errorf("AO_MAX_TURNS must be positive, got %d", v)
 				}
 				if !cmd.Flags().Changed("max-turns") {
-					flags.maxTurns = v
+					opts.orchestrator.MaxTurns = v
 				}
 			}
-			if flags.maxTurns <= 0 {
-				return fmt.Errorf("max-turns must be positive, got %d", flags.maxTurns)
+			if opts.orchestrator.MaxTurns <= 0 {
+				return fmt.Errorf("max-turns must be positive, got %d", opts.orchestrator.MaxTurns)
 			}
-			if _, err := mail.ParseAddress(flags.gitAuthor); err != nil {
+			if err := opts.git.Validate(); err != nil {
 				return fmt.Errorf("invalid --git-author: %w", err)
 			}
 			if !cmd.Flags().Changed("public-url") {
 				if envPublicURL := os.Getenv("AO_PUBLIC_URL"); envPublicURL != "" {
-					flags.publicURL = envPublicURL
+					opts.orchestrator.PublicURL = envPublicURL
 				}
 			}
-			if flags.publicURL != "" {
-				u, err := url.Parse(flags.publicURL)
+			if opts.orchestrator.PublicURL != "" {
+				u, err := url.Parse(opts.orchestrator.PublicURL)
 				if err != nil {
 					return fmt.Errorf("invalid --public-url: %w", err)
 				}
@@ -141,45 +138,38 @@ func newServeCommand() *cobra.Command {
 				if u.Host == "" {
 					return fmt.Errorf("invalid --public-url: host must not be empty")
 				}
-				flags.publicURL = strings.TrimRight(flags.publicURL, "/")
+				opts.orchestrator.PublicURL = strings.TrimRight(opts.orchestrator.PublicURL, "/")
 			}
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runServe(cmd.Context(), flags)
+			return runServe(cmd.Context(), *opts)
 		},
 	}
 
-	cmd.Flags().StringVar(&flags.listen, "listen", defaultListen, "Address and port to listen on; must not be exposed to untrusted networks")
-	cmd.Flags().StringVar(&flags.http, "http", defaultHTTP, "Address and port for the HTTP web UI; must not be exposed to untrusted networks")
-	cmd.Flags().StringVar(&flags.namespace, "namespace", defaultNamespace, "Kubernetes namespace where sandbox pods are created")
-	cmd.Flags().StringVar(&flags.toolset, "toolset", defaultToolset, fmt.Sprintf("Default toolset to expose to the LLM (%s)", strings.Join(toolsets.Names(), ", ")))
-	cmd.Flags().StringVar(&flags.image, "image", defaultImage, "Default sandbox container image (overrides toolset default)")
-	cmd.Flags().StringVar(&flags.homeDir, "homedir", defaultHomeDir, "Home directory inside the sandbox persisted via snapshot/restore")
-	cmd.Flags().DurationVar(&flags.toolTimeout, "tool-timeout", session.DefaultToolTimeout, "Maximum duration for a single tool execution")
-	cmd.Flags().StringVar(&flags.stateDir, "state-dir", defaultStateDir, "Directory where session state and snapshots are saved")
-	cmd.Flags().StringArrayVar(&flags.repos, "repo", nil, "Repository URL to register with the forge (repeatable, or AO_REPOS env var)")
-	cmd.Flags().IntVar(&flags.maxTurns, "max-turns", 30, "Maximum number of session turns before ending a run")
-	cmd.Flags().IntVar(&flags.maxConcurrentRuns, "max-concurrent-runs", 4, "Maximum number of concurrent runs reconciled")
-	cmd.Flags().StringVar(&flags.gitAuthor, "git-author", "auto-optimizer <auto-optimizer@users.noreply.github.com>", "Identity configured as git user.name and user.email in each run's sandbox, as `Name <email>`")
-	cmd.Flags().StringVar(&flags.publicURL, "public-url", "", "Public base URL of this server, used for links in pull request bodies, for example https://ao.example.com")
-	cmd.Flags().DurationVar(&flags.readyTimeout, "ready-timeout", run.DefaultReadyTimeout, "Maximum duration to wait for a sandbox to become ready")
-	cmd.Flags().DurationVar(&flags.verifyTimeout, "verify-timeout", run.DefaultVerifyTimeout, "Maximum duration for running a goal's verify command")
-	cmd.Flags().DurationVar(&flags.maxRunDuration, "max-run-duration", run.DefaultMaxDuration, "Default maximum duration for a run when the goal does not specify budget.maxDuration")
+	cmd.Flags().StringVar(&opts.listen, "listen", defaultListen, "Address and port to listen on; must not be exposed to untrusted networks")
+	cmd.Flags().StringVar(&opts.http, "http", defaultHTTP, "Address and port for the HTTP web UI; must not be exposed to untrusted networks")
+	cmd.Flags().StringVar(&opts.toolset, "toolset", defaultToolset, fmt.Sprintf("Default toolset to expose to the LLM (%s)", strings.Join(toolsets.Names(), ", ")))
+	cmd.Flags().StringVar(&opts.stateDir, "state-dir", defaultStateDir, "Directory where session state and snapshots are saved")
+	cmd.Flags().StringArrayVar(&opts.repos, "repo", nil, "Repository URL to register with the forge (repeatable, or AO_REPOS env var)")
+
+	opts.sandbox.AddFlags(cmd.Flags())
+	opts.git.AddFlags(cmd.Flags())
+	opts.orchestrator.AddFlags(cmd.Flags())
 
 	return cmd
 }
 
-func runServe(ctx context.Context, flags serveFlags) error {
+func runServe(ctx context.Context, opts serveOptions) error {
 	ctrl.SetLogger(klog.NewKlogr())
 
 	log := scoped.Log(ctx)
 
-	if flags.homeDir == "" {
-		return errors.New("homedir must not be empty")
+	if err := opts.sandbox.Validate(); err != nil {
+		return err
 	}
 
-	stateDir := flags.stateDir
+	stateDir := opts.stateDir
 	if strings.HasPrefix(stateDir, "~/") {
 		userHome, err := os.UserHomeDir()
 		if err != nil {
@@ -190,9 +180,7 @@ func runServe(ctx context.Context, flags serveFlags) error {
 
 	var baseOpts session.RunOptions
 	baseOpts.InitDefaults()
-	baseOpts.Namespace = flags.namespace
-	baseOpts.HomeDir = flags.homeDir
-	baseOpts.ToolTimeout = flags.toolTimeout
+	baseOpts.ApplySandbox(opts.sandbox)
 	baseOpts.StateDir = stateDir
 
 	signingKey, err := session.LoadOrGenerateSigningKey(filepath.Join(stateDir, "sandbox-signing-key"))
@@ -226,7 +214,7 @@ func runServe(ctx context.Context, flags serveFlags) error {
 	forgeClient := forge.NewGitRemote()
 
 	var repoURLs []string
-	repoURLs = append(repoURLs, flags.repos...)
+	repoURLs = append(repoURLs, opts.repos...)
 	if envRepos := os.Getenv("AO_REPOS"); envRepos != "" {
 		for _, r := range strings.Split(envRepos, ",") {
 			if r = strings.TrimSpace(r); r != "" {
@@ -293,47 +281,33 @@ func runServe(ctx context.Context, flags serveFlags) error {
 			return nil, err
 		}
 
-		opts := baseOpts
-		opts.SystemPrompt = toolset.SystemPrompt()
-
-		image := flags.image
-		if image == "" {
-			image = toolset.DefaultImage()
-		}
-		if image == "" {
-			image = session.DefaultImage
-		}
-		opts.Image = image
+		harnessOpts := baseOpts
+		harnessOpts.SystemPrompt = toolset.SystemPrompt()
+		harnessOpts.Image = opts.sandbox.ResolveImage(toolset.DefaultImage())
 
 		toolsRegistry := tools.NewRegistry()
-		toolsRegistry.ToolTimeout = opts.ToolTimeout
+		toolsRegistry.ToolTimeout = harnessOpts.ToolTimeout
 		toolset.RegisterTools(toolsRegistry)
 
-		return session.NewHarness(llmClient, sandboxClient, toolsRegistry, opts), nil
+		return session.NewHarness(llmClient, sandboxClient, toolsRegistry, harnessOpts), nil
 	}
 
-	orchestratorHarness, err := harnessFactory(flags.toolset)
+	orchestratorHarness, err := harnessFactory(opts.toolset)
 	if err != nil {
 		return fmt.Errorf("initializing orchestrator harness: %w", err)
 	}
 
-	orchestrator, err := run.NewOrchestrator(run.OrchestratorOptions{
-		Store:              stateStore,
-		SessionStore:       sessionStore,
-		Harness:            orchestratorHarness,
-		KubeClient:         mgr.GetClient(),
-		MaxTurns:           flags.maxTurns,
-		MaxConcurrentRuns:  flags.maxConcurrentRuns,
-		GitAuthor:          flags.gitAuthor,
-		PublicURL:          flags.publicURL,
-		ReadyTimeout:       flags.readyTimeout,
-		VerifyTimeout:      flags.verifyTimeout,
-		DefaultMaxDuration: flags.maxRunDuration,
-		ForgeFor: func(repoURL string) (forge.Forge, error) {
-			f, _, err := selectForge(repoURL, githubToken)
-			return f, err
-		},
-	})
+	orchOpts := opts.orchestrator
+	orchOpts.Store = stateStore
+	orchOpts.SessionStore = sessionStore
+	orchOpts.Harness = orchestratorHarness
+	orchOpts.KubeClient = mgr.GetClient()
+	orchOpts.GitAuthor = opts.git.Author
+	orchOpts.ForgeFor = func(repoURL string) (forge.Forge, error) {
+		f, _, err := selectForge(repoURL, githubToken)
+		return f, err
+	}
+	orchestrator, err := run.NewOrchestrator(orchOpts)
 	if err != nil {
 		return fmt.Errorf("initializing orchestrator: %w", err)
 	}
@@ -367,16 +341,16 @@ func runServe(ctx context.Context, flags serveFlags) error {
 	srv, err := sessionapi.NewServer(sessionapi.ServerOptions{
 		Store:          sessionStore,
 		StateStore:     stateStore,
-		DefaultToolset: flags.toolset,
+		DefaultToolset: opts.toolset,
 		HarnessFactory: harnessFactory,
 	})
 	if err != nil {
 		return fmt.Errorf("initializing session service server: %w", err)
 	}
 
-	listener, err := net.Listen("tcp", flags.listen)
+	listener, err := net.Listen("tcp", opts.listen)
 	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", flags.listen, err)
+		return fmt.Errorf("failed to listen on %s: %w", opts.listen, err)
 	}
 	defer func() {
 		if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
@@ -387,18 +361,18 @@ func runServe(ctx context.Context, flags serveFlags) error {
 	grpcServer := grpc.NewServer()
 	sessionv1.RegisterSessionServiceServer(grpcServer, srv)
 
-	log.Info("session server listening", "listen", flags.listen, "stateDir", stateDir)
+	log.Info("session server listening", "listen", opts.listen, "stateDir", stateDir)
 
 	var httpListener net.Listener
 	var httpServer *http.Server
-	if flags.http != "" {
+	if opts.http != "" {
 		webHandler, err := web.NewServer(srv, stateStore)
 		if err != nil {
 			return fmt.Errorf("initializing web server: %w", err)
 		}
-		httpListener, err = net.Listen("tcp", flags.http)
+		httpListener, err = net.Listen("tcp", opts.http)
 		if err != nil {
-			return fmt.Errorf("failed to listen on HTTP %s: %w", flags.http, err)
+			return fmt.Errorf("failed to listen on HTTP %s: %w", opts.http, err)
 		}
 		defer func() {
 			if closeErr := httpListener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
@@ -406,7 +380,7 @@ func runServe(ctx context.Context, flags serveFlags) error {
 			}
 		}()
 		httpServer = &http.Server{Handler: webHandler}
-		log.Info("web UI listening", "http", flags.http)
+		log.Info("web UI listening", "http", opts.http)
 	}
 
 	errCh := make(chan error, 2)

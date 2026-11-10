@@ -16,11 +16,49 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/mail"
 
+	"github.com/spf13/pflag"
+
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
 )
+
+// DefaultGitAuthor is the default author identity configured as git user.name and user.email in each run's sandbox.
+const DefaultGitAuthor = "auto-optimizer <auto-optimizer@users.noreply.github.com>"
+
+// GitOptions configures git identity and settings for sandbox operations.
+type GitOptions struct {
+	Author string
+}
+
+// InitDefaults fills zero-valued fields with default constants.
+func (o *GitOptions) InitDefaults() {
+	if o == nil {
+		return
+	}
+	if o.Author == "" {
+		o.Author = DefaultGitAuthor
+	}
+}
+
+// AddFlags binds git flags to fs.
+func (o *GitOptions) AddFlags(fs *pflag.FlagSet) {
+	o.InitDefaults()
+	fs.StringVar(&o.Author, "git-author", o.Author, "Identity configured as git user.name and user.email in each run's sandbox, as `Name <email>`")
+}
+
+// Validate verifies that the git options are valid.
+func (o *GitOptions) Validate() error {
+	if o == nil {
+		return errors.New("git options are required")
+	}
+	if _, err := mail.ParseAddress(o.Author); err != nil {
+		return fmt.Errorf("invalid author %q: %w", o.Author, err)
+	}
+	return nil
+}
 
 // ConfigureGitIdentity configures user.name and user.email in the sandbox repository.
 // If repoDir is empty, it defaults to "/workspace/repo".

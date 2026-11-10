@@ -38,6 +38,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/revlist"
+	"github.com/spf13/pflag"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -6097,6 +6098,42 @@ func TestOrchestratorOptions_Defaults(t *testing.T) {
 	}
 	if customOpts.DefaultMaxDuration != 20*time.Minute {
 		t.Errorf("custom DefaultMaxDuration was overwritten: %v", customOpts.DefaultMaxDuration)
+	}
+}
+
+func TestOrchestratorOptions_AddFlags(t *testing.T) {
+	var opts OrchestratorOptions
+	fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
+	opts.AddFlags(fs)
+
+	if err := fs.Parse([]string{
+		"--max-turns", "25",
+		"--max-concurrent-runs", "3",
+		"--public-url", "https://flag.example.com",
+		"--ready-timeout", "2m",
+		"--verify-timeout", "5m",
+		"--max-run-duration", "30m",
+	}); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if opts.MaxTurns != 25 {
+		t.Errorf("MaxTurns = %d, want 25", opts.MaxTurns)
+	}
+	if opts.MaxConcurrentRuns != 3 {
+		t.Errorf("MaxConcurrentRuns = %d, want 3", opts.MaxConcurrentRuns)
+	}
+	if opts.PublicURL != "https://flag.example.com" {
+		t.Errorf("PublicURL = %q, want 'https://flag.example.com'", opts.PublicURL)
+	}
+	if opts.ReadyTimeout != 2*time.Minute {
+		t.Errorf("ReadyTimeout = %v, want 2m", opts.ReadyTimeout)
+	}
+	if opts.VerifyTimeout != 5*time.Minute {
+		t.Errorf("VerifyTimeout = %v, want 5m", opts.VerifyTimeout)
+	}
+	if opts.DefaultMaxDuration != 30*time.Minute {
+		t.Errorf("DefaultMaxDuration = %v, want 30m", opts.DefaultMaxDuration)
 	}
 }
 
