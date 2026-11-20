@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -96,6 +97,9 @@ const (
 
 	// portalBindRetryInterval is the retry interval used when binding an egress policy fails.
 	portalBindRetryInterval = 5 * time.Second
+
+	// shutdownTimeout is the duration Start waits for turn workers to finish on shutdown.
+	shutdownTimeout = 20 * time.Second
 )
 
 type runIndexEntry struct {
@@ -277,7 +281,10 @@ type Orchestrator struct {
 
 	notifyCh chan event.TypedGenericEvent[reconcile.Request]
 
+	shutdownTimeout time.Duration
+
 	activeRunsMu  sync.Mutex
+	shuttingDown  bool
 	activeRuns    map[string]bool
 	workerCancels map[string]context.CancelFunc
 	workerWG      sync.WaitGroup
@@ -358,6 +365,7 @@ func NewOrchestrator(opts OrchestratorOptions) (*Orchestrator, error) {
 		policyFactory:         opts.PolicyFactory,
 		workspaceStorageClass: opts.WorkspaceStorageClass,
 		workspaceSize:         opts.WorkspaceSize,
+		shutdownTimeout:       shutdownTimeout,
 		runIndex:              make(map[string]runIndexEntry),
 		notifyCh:              make(chan event.TypedGenericEvent[reconcile.Request], 1024),
 		activeRuns:            make(map[string]bool),
@@ -482,6 +490,7 @@ func (o *Orchestrator) SetupWithManager(mgr manager.Manager) error {
 
 // Start implements manager.Runnable. On manager startup it calls Resume,
 // which enqueues all non-terminal runs. It then blocks until ctx is cancelled.
+// After ctx is cancelled, Start waits for active turn workers to finish before returning.
 func (o *Orchestrator) Start(ctx context.Context) error {
 	o.managerCtxMu.Lock()
 	o.managerCtx = ctx
@@ -502,6 +511,33 @@ func (o *Orchestrator) Start(ctx context.Context) error {
 		}()
 	}
 	<-ctx.Done()
+
+	o.activeRunsMu.Lock()
+	o.shuttingDown = true
+	o.activeRunsMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		o.workerWG.Wait()
+		close(done)
+	}()
+
+	timer := time.NewTimer(o.shutdownTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+	case <-timer.C:
+		o.activeRunsMu.Lock()
+		active := make([]string, 0, len(o.activeRuns))
+		for runID := range o.activeRuns {
+			active = append(active, runID)
+		}
+		o.activeRunsMu.Unlock()
+		slices.Sort(active)
+		scoped.Log(ctx).Info("shutdown wait timed out with active turn workers", "runs", active)
+	}
+
 	return nil
 }
 
@@ -1269,7 +1305,7 @@ func (o *Orchestrator) setRunActive(runID string, active bool) bool {
 	o.activeRunsMu.Lock()
 	defer o.activeRunsMu.Unlock()
 	if active {
-		if o.activeRuns[runID] {
+		if o.shuttingDown || o.activeRuns[runID] {
 			return false
 		}
 		o.activeRuns[runID] = true
@@ -1561,7 +1597,7 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 }
 
 func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *state.Run) {
-	if o.isManagerCanceled() {
+	if ctx.Err() != nil || o.isManagerCanceled() {
 		return
 	}
 
@@ -1588,7 +1624,17 @@ func (o *Orchestrator) startTurn(ctx context.Context, repo *state.Repo, run *sta
 	workerCtx, cancel := context.WithCancel(o.getWorkerContext(ctx))
 	o.setWorkerCancel(run.ID, cancel)
 
+	o.activeRunsMu.Lock()
+	if o.shuttingDown || ctx.Err() != nil || o.isManagerCanceled() {
+		delete(o.activeRuns, run.ID)
+		delete(o.workerCancels, run.ID)
+		o.activeRunsMu.Unlock()
+		cancel()
+		return
+	}
 	o.workerWG.Add(1)
+	o.activeRunsMu.Unlock()
+
 	go func() {
 		defer o.workerWG.Done()
 		defer cancel()

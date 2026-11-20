@@ -71,9 +71,11 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/portal"
+	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 	"github.com/gke-labs/auto-optimizer/pkg/session"
 	"github.com/gke-labs/auto-optimizer/pkg/state"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
+	"github.com/go-logr/logr/funcr"
 )
 
 type mockProcessServer struct {
@@ -2046,14 +2048,18 @@ func startReconcileDriver(t *testing.T, orch *Orchestrator) *reconcileDriver {
 		ctx:    ctx,
 		cancel: cancel,
 	}
+
+	startDone := make(chan struct{})
+	go func() {
+		_ = orch.Start(ctx)
+		close(startDone)
+	}()
+
 	t.Cleanup(func() {
 		cancel()
 		queue.ShutDown()
+		<-startDone
 	})
-
-	go func() {
-		_ = orch.Start(ctx)
-	}()
 
 	go func() {
 		for {
@@ -2491,19 +2497,23 @@ func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
 		t.Fatalf("NewOrchestrator: %v", err)
 	}
 
+	startDone := make(chan struct{})
 	go func() {
 		_ = orch.Start(testCtx)
+		close(startDone)
 	}()
+	t.Cleanup(func() {
+		cancel()
+		<-startDone
+	})
 
 	// Reconcile with the cancellable context. The LLM will cancel the context during the session.
 	_, _ = orch.Reconcile(testCtx, runRequest(orch, repo.Key(), runID))
 
-	deadline := time.Now().Add(5 * time.Second)
-	for orch.isRunActive(runID) {
-		if time.Now().After(deadline) {
-			t.Fatal("timed out waiting for worker to stop after context cancellation")
-		}
-		time.Sleep(5 * time.Millisecond)
+	select {
+	case <-startDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for Start to return after context cancellation")
 	}
 
 	// Check with test context: run MUST stay in Working phase
@@ -8382,4 +8392,138 @@ func TestOrchestrator_WorkspaceClaim(t *testing.T) {
 			t.Errorf("expected claim not found, got %v", err)
 		}
 	})
+}
+
+type blockingChatClient struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingChatClient) CreateChatCompletion(context.Context, llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	close(b.started)
+	<-b.release
+	done := "done"
+	return &llm.ChatCompletionResponse{
+		Choices: []llm.Choice{{Message: llm.Message{Role: "assistant", Content: &done}}},
+	}, nil
+}
+
+func setupShutdownTest(t *testing.T, llmClient llm.ChatClient) (*Orchestrator, *state.Repo, *state.Run) {
+	t.Helper()
+	runID, sbName := "20261030T120000Z-shutdown", "run-shutdown"
+	now := time.Now()
+	deadline := now.Add(30 * time.Minute)
+	store, sessionStore, repo, run, harness, _ := setupWorkingTestRun(t, runID, sbName, &deadline, llmClient)
+	orch, err := NewOrchestrator(OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("NewOrchestrator: %v", err)
+	}
+	return orch, repo, run
+}
+
+func TestOrchestrator_Start_WaitsForRunningWorker(t *testing.T) {
+	llmClient := &blockingChatClient{started: make(chan struct{}), release: make(chan struct{})}
+	orch, repo, run := setupShutdownTest(t, llmClient)
+
+	startCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	startDone := make(chan struct{})
+	go func() {
+		_ = orch.Start(startCtx)
+		close(startDone)
+	}()
+
+	if _, err := orch.Reconcile(t.Context(), runRequest(orch, repo.Key(), run.ID)); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	<-llmClient.started
+
+	cancel()
+
+	select {
+	case <-startDone:
+		t.Fatal("Start returned while turn worker was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(llmClient.release)
+
+	select {
+	case <-startDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after worker finished")
+	}
+}
+
+func TestOrchestrator_Start_ShutdownTimeoutLogsRun(t *testing.T) {
+	llmClient := &blockingChatClient{started: make(chan struct{}), release: make(chan struct{})}
+	orch, repo, run := setupShutdownTest(t, llmClient)
+	orch.shutdownTimeout = 20 * time.Millisecond
+	t.Cleanup(func() {
+		close(llmClient.release)
+		orch.workerWG.Wait()
+	})
+
+	var mu sync.Mutex
+	var logs []string
+	logger := funcr.New(func(_, args string) {
+		mu.Lock()
+		defer mu.Unlock()
+		logs = append(logs, args)
+	}, funcr.Options{})
+
+	startCtx, cancel := context.WithCancel(scoped.WithLog(t.Context(), logger))
+	defer cancel()
+
+	startDone := make(chan struct{})
+	go func() {
+		_ = orch.Start(startCtx)
+		close(startDone)
+	}()
+
+	if _, err := orch.Reconcile(t.Context(), runRequest(orch, repo.Key(), run.ID)); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	<-llmClient.started
+
+	cancel()
+
+	select {
+	case <-startDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after shutdown bound")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	joined := strings.Join(logs, " ")
+	if !strings.Contains(joined, run.ID) {
+		t.Errorf("expected logs to mention run %s, got: %s", run.ID, joined)
+	}
+}
+
+func TestOrchestrator_StartTurn_AfterCancellation_StartsNoWorker(t *testing.T) {
+	llmClient := &blockingChatClient{started: make(chan struct{}), release: make(chan struct{})}
+	defer close(llmClient.release)
+	orch, repo, run := setupShutdownTest(t, llmClient)
+
+	cancCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	orch.startTurn(cancCtx, repo, run)
+
+	if orch.isRunActive(run.ID) {
+		t.Errorf("expected run not to be active")
+	}
+	select {
+	case <-llmClient.started:
+		t.Fatal("worker was started after context cancellation")
+	default:
+	}
 }
