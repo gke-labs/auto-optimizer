@@ -796,6 +796,7 @@ func (o *Orchestrator) buildCreateSandboxOptions(ctx context.Context, repo *stat
 		ShutdownTime:       sbShutdown,
 		WorkspaceClaimName: run.WorkspaceClaimName,
 		PortalIntercept:    o.portalBinder != nil,
+		ExtendLifecycle:    false,
 	}
 }
 
@@ -913,31 +914,7 @@ func (o *Orchestrator) publishHeroRun(ctx context.Context, repo *state.Repo, run
 
 // isSandboxFailed inspects sandbox status conditions to detect failure before readiness.
 func isSandboxFailed(sb *sandboxv1beta1.Sandbox) (string, bool) {
-	for _, cond := range sb.Status.Conditions {
-		if cond.Type == string(sandboxv1beta1.SandboxConditionFinished) && cond.Status == metav1.ConditionTrue {
-			if cond.Reason == sandboxv1beta1.SandboxReasonPodFailed {
-				msg := cond.Message
-				if msg == "" {
-					msg = fmt.Sprintf("pod finished (%s)", cond.Reason)
-				}
-				return msg, true
-			}
-		}
-		if cond.Type == string(sandboxv1beta1.SandboxConditionReady) && cond.Status == metav1.ConditionFalse {
-			switch cond.Reason {
-			case sandboxv1beta1.SandboxReasonInvalidConfiguration,
-				sandboxv1beta1.SandboxReasonMultiplePods,
-				sandboxv1beta1.SandboxReasonExpired,
-				sandboxv1beta1.SandboxReasonPodFailed:
-				msg := cond.Message
-				if msg == "" {
-					msg = fmt.Sprintf("sandbox readiness failed (%s)", cond.Reason)
-				}
-				return msg, true
-			}
-		}
-	}
-	return "", false
+	return session.IsSandboxFailed(sb)
 }
 
 // waitForSandboxReady checks whether the Sandbox for run is ready.
@@ -1652,33 +1629,6 @@ func (o *Orchestrator) workRun(ctx context.Context, repo *state.Repo, run *state
 	}
 
 	if o.isRunActive(run.ID) {
-		if o.harness != nil && o.harness.SandboxClient() != nil && run.SandboxName != "" {
-			// Deliberately an uncached live read to immediately detect sandbox deletion
-			// or pod failure conditions during active execution; part 5b (#201) will make
-			// this a cache lookup.
-			sbObj, err := o.harness.SandboxClient().GetSandboxResource(ctx, o.harness.Namespace(), run.SandboxName)
-			if err != nil && !k8serrors.IsNotFound(err) {
-				return reconcile.Result{}, fmt.Errorf("getting sandbox %s: %w", run.SandboxName, err)
-			}
-			var failMsg string
-			if err != nil {
-				failMsg = fmt.Sprintf("sandbox %s was deleted", run.SandboxName)
-			} else if msg, failed := isSandboxFailed(sbObj); failed {
-				failMsg = fmt.Sprintf("sandbox %s failed: %s", run.SandboxName, msg)
-			}
-			if failMsg != "" {
-				o.cancelWorker(run.ID)
-				sb := o.harness.GetOrAttachSandbox(run.SandboxName)
-				o.finishRun(ctx, repo, run, runEnd{
-					Phase:   state.PhaseFailed,
-					Kind:    "sandbox_deleted",
-					Message: failMsg,
-					Sandbox: sb,
-				})
-				return reconcile.Result{}, nil
-			}
-		}
-
 		log.V(2).Info("run is already actively executing a session", "run", run.ID)
 		return reconcile.Result{RequeueAfter: requeueAfter}, nil
 	}
@@ -1735,21 +1685,9 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 		}
 	}
 
-	sb := o.harness.GetOrAttachSandbox(sandboxName)
-	if sb == nil {
-		return turnOutcome{
-			Err:      errors.New("failed to get sandbox handle"),
-			Finished: o.clock().UTC(),
-		}
-	}
-
-	// Verify sandbox exists in Kubernetes and has not expired.
-	// If expired or deleted, fail the run with a clear event.
-	if err := sb.CheckAlive(ctx, o.clock().UTC()); err != nil {
-		return turnOutcome{
-			Err:      fmt.Errorf("sandbox %s expired or deleted: %w", sandboxName, err),
-			Finished: o.clock().UTC(),
-		}
+	var sb *session.Sandbox
+	if o.harness != nil {
+		sb = o.harness.GetOrAttachSandbox(sandboxName)
 	}
 
 	sessionID := run.SessionID
@@ -1786,9 +1724,13 @@ func (o *Orchestrator) runTurnWorker(ctx context.Context, repo *state.Repo, run 
 		}
 	}
 
-	// Bind sandbox to session
+	// Bind sandbox to session if available
 	sess.SetActiveSandbox(sb)
-	sess.FailOnSandboxExpiry = true
+	sbOpts := o.buildCreateSandboxOptions(ctx, repo, run)
+	sess.SetCreateSandboxOptions(sbOpts)
+	sess.SetSandboxPreparer(func(ctx context.Context, s *session.Sandbox) error {
+		return o.prepareSandbox(ctx, repo, run, s)
+	})
 
 	// Seed system prompt if new session
 	if len(sess.Messages()) == 0 {
@@ -1902,20 +1844,6 @@ func (o *Orchestrator) handleTurnOutcome(ctx context.Context, repo *state.Repo, 
 
 	if ctx.Err() != nil || o.isManagerCanceled() || isCanceled(turnErr) {
 		return nil
-	}
-
-	if errors.Is(turnErr, session.ErrSandboxExpired) {
-		msg := "sandbox expired or was deleted during session"
-		if strings.Contains(turnErr.Error(), "expired or deleted") {
-			msg = turnErr.Error()
-		}
-		o.finishRun(ctx, repo, run, runEnd{
-			Phase:   state.PhaseFailed,
-			Kind:    "sandbox_expired",
-			Message: msg,
-			Sandbox: sb,
-		})
-		return errors.New(msg)
 	}
 
 	errMsg := fmt.Sprintf("session error: %v", turnErr)
