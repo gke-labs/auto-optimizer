@@ -30,8 +30,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apiruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	fakek8s "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/tools"
@@ -927,6 +929,194 @@ func TestCreateSandboxWithOptions(t *testing.T) {
 	expectedMax := time.Now().Add(SandboxInactivityTimeout + 10*time.Second)
 	if zeroCreated.Spec.ShutdownTime.Time.Before(expectedMin) || zeroCreated.Spec.ShutdownTime.Time.After(expectedMax) {
 		t.Errorf("expected default ShutdownTime near now + %v, got %v", SandboxInactivityTimeout, zeroCreated.Spec.ShutdownTime.Time)
+	}
+}
+
+func TestEnsureSandbox_OnDemandWithCustomOptionsAndPreparer(t *testing.T) {
+	ctx := t.Context()
+	ns := "test-sandboxes"
+	sessionName := "testsessionondemand"
+	cpNamespace := "ao-system"
+
+	agentsCS := fakeagents.NewSimpleClientset()
+	coreCS := fakek8s.NewSimpleClientset()
+	client := NewSandboxClientWithClients(agentsCS, coreCS.CoreV1())
+
+	agentsCS.PrependReactor("create", "sandboxes", func(action k8stesting.Action) (bool, apiruntime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		sb := createAction.GetObject().(*sandboxv1beta1.Sandbox).DeepCopy()
+		sb.Status.Conditions = []metav1.Condition{
+			{
+				Type:   string(sandboxv1beta1.SandboxConditionReady),
+				Status: metav1.ConditionTrue,
+			},
+		}
+		_ = agentsCS.Tracker().Create(action.GetResource(), sb, action.GetNamespace())
+		return true, sb, nil
+	})
+
+	_, privKey, err := ed25519.GenerateKey(cryptorand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	harness := NewHarness(nil, client, nil, RunOptions{
+		Namespace:             ns,
+		ControlPlaneNamespace: cpNamespace,
+		SigningKey:            privKey,
+	})
+
+	sessionStore := NewFileStore(t.TempDir())
+	sess, err := harness.NewSession(ctx, sessionStore, sessionName, Metadata{CreatedAt: time.Now()})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	claimName := "claim-ondemand"
+	sess.SetCreateSandboxOptions(CreateSandboxOptions{
+		Name:               sessionName,
+		Labels:             map[string]string{"run-id": "123"},
+		WorkspaceClaimName: claimName,
+		ShutdownTime:       time.Now().Add(2 * time.Hour),
+		ExtendLifecycle:    false,
+	})
+
+	prepareCount := 0
+	sess.SetSandboxPreparer(func(ctx context.Context, sb *Sandbox) error {
+		prepareCount++
+		return nil
+	})
+
+	// First ensureSandbox call creates the sandbox on demand and runs preparer
+	sb1, err := harness.ensureSandbox(ctx, sess)
+	if err != nil {
+		t.Fatalf("ensureSandbox 1: %v", err)
+	}
+	if sb1 == nil {
+		t.Fatal("expected non-nil sandbox")
+	}
+	if prepareCount != 1 {
+		t.Errorf("expected prepareCount 1, got %d", prepareCount)
+	}
+
+	// Verify created sandbox resource
+	res1, err := client.GetSandboxResource(ctx, ns, sessionName)
+	if err != nil {
+		t.Fatalf("getting sandbox resource: %v", err)
+	}
+	if res1.Labels["run-id"] != "123" {
+		t.Errorf("expected label 123, got %q", res1.Labels["run-id"])
+	}
+
+	// Delete sandbox externally
+	if err := agentsCS.AgentsV1beta1().Sandboxes(ns).Delete(ctx, sessionName, metav1.DeleteOptions{}); err != nil {
+		t.Fatalf("deleting sandbox: %v", err)
+	}
+
+	// Drop dead sandbox through helper and verify ensureSandbox recreates on demand, calling preparer again
+	harness.dropDeadSandbox(ctx, sess, sess.activeSandbox)
+	sb2, err := harness.ensureSandbox(ctx, sess)
+	if err != nil {
+		t.Fatalf("ensureSandbox 2: %v", err)
+	}
+	if sb2 == nil {
+		t.Fatal("expected non-nil sandbox on recreation")
+	}
+	if prepareCount != 2 {
+		t.Errorf("expected prepareCount 2, got %d", prepareCount)
+	}
+}
+
+type mockControlPlaneTool struct {
+	calledWithSb tools.Sandbox
+	called       bool
+}
+
+func (m *mockControlPlaneTool) Schema() llm.Tool {
+	return llm.Tool{
+		Type: "function",
+		Function: llm.ToolFunction{
+			Name:        "mock_cp_tool",
+			Description: "a mock control plane tool",
+		},
+	}
+}
+
+func (m *mockControlPlaneTool) Run(ctx context.Context, sb tools.Sandbox) (llm.Message, error) {
+	m.called = true
+	m.calledWithSb = sb
+	if sb != nil {
+		return llm.Message{}, fmt.Errorf("expected sb == nil, got %v", sb)
+	}
+	content := "success"
+	return llm.Message{Role: "tool", Content: &content}, nil
+}
+
+func TestControlPlaneTool_RunsBeforeSandboxExists(t *testing.T) {
+	ctx := t.Context()
+	cpTool := &mockControlPlaneTool{}
+
+	done := "done"
+	mockLLM := &scriptedLLM{
+		responses: []*llm.ChatCompletionResponse{
+			{
+				ID: "cp-call",
+				Choices: []llm.Choice{
+					{
+						Message: llm.Message{
+							Role: "assistant",
+							ToolCalls: []llm.ToolCall{
+								{
+									ID:   "call-1",
+									Type: "function",
+									Function: llm.FunctionCall{
+										Name:      "mock_cp_tool",
+										Arguments: "{}",
+									},
+								},
+							},
+						},
+						FinishReason: "tool_calls",
+					},
+				},
+			},
+			{
+				ID: "cp-done",
+				Choices: []llm.Choice{
+					{
+						Message: llm.Message{
+							Role:    "assistant",
+							Content: &done,
+						},
+						FinishReason: "stop",
+					},
+				},
+			},
+		},
+	}
+
+	harness := NewHarness(mockLLM, nil, nil, RunOptions{}).WithExtraTools(cpTool)
+	sessionStore := NewFileStore(t.TempDir())
+	sess, err := harness.NewSession(ctx, sessionStore, "cpsession", Metadata{CreatedAt: time.Now()})
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	// Verify no sandbox exists initially
+	if sess.activeSandbox != nil {
+		t.Fatal("expected activeSandbox to be nil")
+	}
+
+	events := &recordingEvents{}
+	if err := harness.RunTurn(ctx, sess, "run cp tool", events); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+
+	if !cpTool.called {
+		t.Fatal("expected mock_cp_tool to be called")
+	}
+	if cpTool.calledWithSb != nil {
+		t.Errorf("expected mock_cp_tool to receive nil Sandbox, got %v", cpTool.calledWithSb)
 	}
 }
 

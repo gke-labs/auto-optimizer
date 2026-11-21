@@ -48,9 +48,11 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apiruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	fakek8s "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
@@ -1393,7 +1395,8 @@ func TestOrchestrator_Working_ExpiredSandbox_AtStart(t *testing.T) {
 	}
 
 	harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
-	// Sandbox is intentionally NOT created in fake k8s (already expired/deleted)
+	// Sandbox is intentionally NOT created in fake k8s (already expired/deleted).
+	// A run gets its Sandbox on demand; a missing sandbox does not fail the run.
 
 	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
 	orch := newTestOrchestrator(t, OrchestratorOptions{
@@ -1404,70 +1407,99 @@ func TestOrchestrator_Working_ExpiredSandbox_AtStart(t *testing.T) {
 		MaxTurns:     30,
 	})
 
-	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
-		t.Logf("reconcileWorkingRun completed (errors handled)")
+	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
+		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
-	// Verify run transitioned to Failed
+	// Verify run carried on to NoImprovement
 	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
-	if gotRun.Phase != state.PhaseFailed {
-		t.Errorf("expected phase %s, got %s", state.PhaseFailed, gotRun.Phase)
-	}
-	if !strings.Contains(gotRun.Error, "expired or deleted") && !strings.Contains(gotRun.Error, "not found") {
-		t.Errorf("expected error to mention expired or deleted, got: %s", gotRun.Error)
+	if gotRun.Phase != state.PhaseNoImprovement {
+		t.Errorf("expected phase %s, got %s", state.PhaseNoImprovement, gotRun.Phase)
 	}
 
-	// Verify failure event was recorded
 	events, err := store.ReadEvents(ctx, repo.Key(), runID)
 	if err != nil {
 		t.Fatalf("ReadEvents: %v", err)
 	}
-	var foundFailEvent bool
 	for _, e := range events {
-		if e.Phase == state.PhaseFailed && (strings.Contains(e.Message, "expired or deleted") || strings.Contains(e.Message, "not found")) {
-			foundFailEvent = true
-			break
+		if e.Kind == "sandbox_expired" {
+			t.Errorf("unexpected sandbox_expired event: %+v", e)
 		}
-	}
-	if !foundFailEvent {
-		t.Errorf("expected failure event mentioning expired or deleted sandbox, got events: %+v", events)
 	}
 }
 
 type deleteSandboxLLM struct {
 	agentsCS *fakeagents.Clientset
 	sbName   string
+	called   bool
 }
 
 func (d *deleteSandboxLLM) CreateChatCompletion(ctx context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
-	// Simulate sandbox expiring/being deleted in k8s during turn
-	_ = d.agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Delete(ctx, d.sbName, metav1.DeleteOptions{})
+	if !d.called {
+		d.called = true
+		// Simulate sandbox expiring/being deleted in k8s during turn
+		_ = d.agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Delete(ctx, d.sbName, metav1.DeleteOptions{})
 
-	args, _ := json.Marshal(map[string]string{"command": "echo after deletion"})
-	return &llm.ChatCompletionResponse{
-		ID: "delete-llm",
-		Choices: []llm.Choice{
-			{
-				Message: llm.Message{
-					Role: "assistant",
-					ToolCalls: []llm.ToolCall{
-						{
-							ID:   "call-after-del",
-							Type: "function",
-							Function: llm.FunctionCall{
-								Name:      "run_command",
-								Arguments: string(args),
+		args, _ := json.Marshal(map[string]string{"command": "echo after deletion"})
+		return &llm.ChatCompletionResponse{
+			ID: "delete-llm",
+			Choices: []llm.Choice{
+				{
+					Message: llm.Message{
+						Role: "assistant",
+						ToolCalls: []llm.ToolCall{
+							{
+								ID:   "call-after-del",
+								Type: "function",
+								Function: llm.FunctionCall{
+									Name:      "run_command",
+									Arguments: string(args),
+								},
 							},
 						},
 					},
+					FinishReason: "tool_calls",
 				},
-				FinishReason: "tool_calls",
+			},
+		}, nil
+	}
+
+	done := "done after tool"
+	return &llm.ChatCompletionResponse{
+		ID: "delete-llm-done",
+		Choices: []llm.Choice{
+			{
+				Message: llm.Message{
+					Role:    "assistant",
+					Content: &done,
+				},
+				FinishReason: "stop",
 			},
 		},
 	}, nil
+}
+
+type failingOnFirstCallServer struct {
+	processv1.UnimplementedProcessServiceServer
+	mu         sync.Mutex
+	failedOnce bool
+}
+
+func (f *failingOnFirstCallServer) Execute(ctx context.Context, req *processv1.ExecuteRequest) (*processv1.ExecuteResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cmd := req.GetConfig().GetCommand()
+	if len(cmd) >= 4 && cmd[0] == "git" && cmd[1] == "-C" && cmd[2] == "/workspace/repo" && cmd[3] == "rev-parse" {
+		return &processv1.ExecuteResponse{ExitCode: 0, Stdout: []byte(".git\n")}, nil
+	}
+	if !f.failedOnce {
+		f.failedOnce = true
+		return nil, status.Error(codes.Unavailable, "sandbox connection lost")
+	}
+	return &processv1.ExecuteResponse{ExitCode: 0, Stdout: []byte("after deletion\n")}, nil
 }
 
 func TestOrchestrator_Working_ExpiredSandbox_DuringSession(t *testing.T) {
@@ -1489,33 +1521,59 @@ func TestOrchestrator_Working_ExpiredSandbox_DuringSession(t *testing.T) {
 
 	runID := "20261030T120000Z-expduring"
 	sandboxName := "run-20261030t120000z-expduring"
+	claimName := "claim-expduring"
 	run := &state.Run{
-		ID:          runID,
-		Repo:        repo.Key(),
-		GoalName:    "expired-during",
-		Phase:       state.PhaseWorking,
-		BaseCommit:  "base-sha-exp2",
-		SandboxName: sandboxName,
+		ID:                 runID,
+		Repo:               repo.Key(),
+		GoalName:           "expired-during",
+		Phase:              state.PhaseWorking,
+		BaseCommit:         "base-sha-exp2",
+		SandboxName:        sandboxName,
+		WorkspaceClaimName: claimName,
 	}
 	if err := store.PutRun(ctx, run); err != nil {
 		t.Fatalf("PutRun: %v", err)
 	}
 
-	procSrv := &mockProcessServer{}
+	procSrv := &failingOnFirstCallServer{}
 	delLLM := &deleteSandboxLLM{sbName: sandboxName}
 	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, delLLM)
 	delLLM.agentsCS = agentsCS
+
+	var createdSandbox *sandboxv1beta1.Sandbox
+	agentsCS.PrependReactor("create", "sandboxes", func(action k8stesting.Action) (bool, apiruntime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		sb := createAction.GetObject().(*sandboxv1beta1.Sandbox).DeepCopy()
+		createdSandbox = sb
+		sb.Status.Conditions = []metav1.Condition{
+			{
+				Type:   string(sandboxv1beta1.SandboxConditionReady),
+				Status: metav1.ConditionTrue,
+			},
+		}
+		_ = agentsCS.Tracker().Create(action.GetResource(), sb, action.GetNamespace())
+		return true, sb, nil
+	})
 
 	policy := sandboxv1beta1.ShutdownPolicyDelete
 	_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      sandboxName,
 			Namespace: "ao-sandboxes",
+			Labels:    map[string]string{LabelRun: runID},
 		},
 		Spec: sandboxv1beta1.SandboxSpec{
 			Lifecycle: sandboxv1beta1.Lifecycle{
 				ShutdownTime:   &metav1.Time{Time: time.Now().Add(5 * time.Minute)},
 				ShutdownPolicy: &policy,
+			},
+		},
+		Status: sandboxv1beta1.SandboxStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   string(sandboxv1beta1.SandboxConditionReady),
+					Status: metav1.ConditionTrue,
+				},
 			},
 		},
 	}, metav1.CreateOptions{})
@@ -1532,19 +1590,257 @@ func TestOrchestrator_Working_ExpiredSandbox_DuringSession(t *testing.T) {
 		MaxTurns:     30,
 	})
 
-	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
-		t.Logf("reconcileWorkingRun completed (errors handled)")
+	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
+		t.Fatalf("reconcileWorkingRun: %v", err)
 	}
 
 	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
 	if err != nil {
 		t.Fatalf("GetRun: %v", err)
 	}
-	if gotRun.Phase != state.PhaseFailed {
-		t.Errorf("expected phase %s, got %s", state.PhaseFailed, gotRun.Phase)
+	if gotRun.Phase != state.PhaseNoImprovement {
+		t.Errorf("expected phase %s, got %s (error: %s)", state.PhaseNoImprovement, gotRun.Phase, gotRun.Error)
 	}
-	if !strings.Contains(gotRun.Error, "expired or was deleted") {
-		t.Errorf("expected error to mention expired or deleted, got: %s", gotRun.Error)
+
+	// Verify new sandbox was created with the same claim
+	if createdSandbox == nil {
+		t.Fatal("expected new sandbox to be created on demand")
+	}
+	var foundClaim bool
+	for _, v := range createdSandbox.Spec.PodTemplate.Spec.Volumes {
+		if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == claimName {
+			foundClaim = true
+			break
+		}
+	}
+	if !foundClaim {
+		t.Errorf("expected created sandbox to mount %s, got volumes: %+v", claimName, createdSandbox.Spec.PodTemplate.Spec.Volumes)
+	}
+}
+
+type midToolDeletingServer struct {
+	processv1.UnimplementedProcessServiceServer
+	mu          sync.Mutex
+	agentsCS    *fakeagents.Clientset
+	sbName      string
+	deletedOnce bool
+	retriedOnce bool
+}
+
+func (m *midToolDeletingServer) Execute(ctx context.Context, req *processv1.ExecuteRequest) (*processv1.ExecuteResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cmd := req.GetConfig().GetCommand()
+	if len(cmd) >= 4 && cmd[0] == "git" && cmd[1] == "-C" && cmd[2] == "/workspace/repo" && cmd[3] == "rev-parse" {
+		return &processv1.ExecuteResponse{
+			ExitCode: 0,
+			Stdout:   []byte(".git\n"),
+		}, nil
+	}
+
+	for _, c := range cmd {
+		if c == "interrupted-tool" {
+			if !m.deletedOnce {
+				m.deletedOnce = true
+				_ = m.agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Delete(ctx, m.sbName, metav1.DeleteOptions{})
+				return nil, status.Error(codes.Unavailable, "sandbox container died")
+			}
+			m.retriedOnce = true
+			return &processv1.ExecuteResponse{
+				ExitCode: 0,
+				Stdout:   []byte("success on retry\n"),
+			}, nil
+		}
+	}
+
+	return &processv1.ExecuteResponse{ExitCode: 0}, nil
+}
+
+type toolCallingThenStopLLM struct {
+	called bool
+}
+
+func (t *toolCallingThenStopLLM) CreateChatCompletion(ctx context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	if !t.called {
+		t.called = true
+		args, _ := json.Marshal(map[string]string{"command": "interrupted-tool"})
+		return &llm.ChatCompletionResponse{
+			ID: "tool-llm",
+			Choices: []llm.Choice{
+				{
+					Message: llm.Message{
+						Role: "assistant",
+						ToolCalls: []llm.ToolCall{
+							{
+								ID:   "call-interrupted",
+								Type: "function",
+								Function: llm.FunctionCall{
+									Name:      "run_command",
+									Arguments: string(args),
+								},
+							},
+						},
+					},
+					FinishReason: "tool_calls",
+				},
+			},
+		}, nil
+	}
+
+	done := "finished successfully"
+	return &llm.ChatCompletionResponse{
+		ID: "tool-llm-done",
+		Choices: []llm.Choice{
+			{
+				Message: llm.Message{
+					Role:    "assistant",
+					Content: &done,
+				},
+				FinishReason: "stop",
+			},
+		},
+	}, nil
+}
+
+func TestOrchestrator_Working_ToolCallInterruptedBySandboxDeletion_RetriedAndFinishes(t *testing.T) {
+	ctx := t.Context()
+	storeDir := t.TempDir()
+	store := state.NewFileStore(storeDir)
+	sessionStore := session.NewFileStore(storeDir)
+
+	repo := &state.Repo{
+		URL:           "https://github.com/gke-labs/test-repo",
+		Host:          "github.com",
+		Owner:         "gke-labs",
+		Name:          "test-repo",
+		DefaultBranch: "main",
+	}
+	if err := store.PutRepo(ctx, repo); err != nil {
+		t.Fatalf("PutRepo: %v", err)
+	}
+
+	runID := "20261030T120000Z-toolinterrupted"
+	sandboxName := "run-toolinterrupted"
+	claimName := "claim-toolinterrupted"
+	deadline := time.Date(2026, 10, 30, 13, 0, 0, 0, time.UTC)
+	run := &state.Run{
+		ID:                 runID,
+		Repo:               repo.Key(),
+		GoalName:           "tool-interrupted-goal",
+		Phase:              state.PhaseWorking,
+		BaseCommit:         "base-sha-tool",
+		SandboxName:        sandboxName,
+		WorkspaceClaimName: claimName,
+		Deadline:           &deadline,
+	}
+	if err := store.PutRun(ctx, run); err != nil {
+		t.Fatalf("PutRun: %v", err)
+	}
+
+	procSrv := &midToolDeletingServer{sbName: sandboxName}
+	toolLLM := &toolCallingThenStopLLM{}
+	harness, agentsCS, _ := setupTestHarnessWithLLM(t, procSrv, toolLLM)
+	procSrv.agentsCS = agentsCS
+
+	var createdSandbox *sandboxv1beta1.Sandbox
+	agentsCS.PrependReactor("create", "sandboxes", func(action k8stesting.Action) (bool, apiruntime.Object, error) {
+		createAction := action.(k8stesting.CreateAction)
+		sb := createAction.GetObject().(*sandboxv1beta1.Sandbox).DeepCopy()
+		createdSandbox = sb
+		sb.Status.Conditions = []metav1.Condition{
+			{
+				Type:   string(sandboxv1beta1.SandboxConditionReady),
+				Status: metav1.ConditionTrue,
+			},
+		}
+		_ = agentsCS.Tracker().Create(action.GetResource(), sb, action.GetNamespace())
+		return true, sb, nil
+	})
+
+	policy := sandboxv1beta1.ShutdownPolicyDelete
+	_, err := agentsCS.AgentsV1beta1().Sandboxes("ao-sandboxes").Create(ctx, &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      sandboxName,
+			Namespace: "ao-sandboxes",
+			Labels:    map[string]string{LabelRun: runID},
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			Lifecycle: sandboxv1beta1.Lifecycle{
+				ShutdownTime:   &metav1.Time{Time: deadline.Add(SandboxShutdownGrace)},
+				ShutdownPolicy: &policy,
+			},
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Volumes: []corev1.Volume{
+							{
+								Name: "workspace",
+								VolumeSource: corev1.VolumeSource{
+									PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+										ClaimName: claimName,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Status: sandboxv1beta1.SandboxStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:   string(sandboxv1beta1.SandboxConditionReady),
+					Status: metav1.ConditionTrue,
+				},
+			},
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating initial sandbox: %v", err)
+	}
+
+	fixedTime := time.Date(2026, 10, 30, 12, 10, 0, 0, time.UTC)
+	orch := newTestOrchestrator(t, OrchestratorOptions{
+		Store:        store,
+		SessionStore: sessionStore,
+		Harness:      harness,
+		Clock:        func() time.Time { return fixedTime },
+		MaxTurns:     30,
+	})
+
+	if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
+		t.Fatalf("reconcileWorkingRun: %v", err)
+	}
+
+	gotRun, err := store.GetRun(ctx, repo.Key(), runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.Phase != state.PhaseNoImprovement {
+		t.Errorf("expected phase %s, got %s (error: %s)", state.PhaseNoImprovement, gotRun.Phase, gotRun.Error)
+	}
+
+	if !procSrv.deletedOnce {
+		t.Error("expected sandbox to be deleted once during mid-tool execution")
+	}
+	if !procSrv.retriedOnce {
+		t.Error("expected tool call to be retried after sandbox deletion")
+	}
+
+	// Verify new sandbox was created with the same workspace claim
+	if createdSandbox == nil {
+		t.Fatal("expected new sandbox to be created on demand")
+	}
+	var foundClaim bool
+	for _, v := range createdSandbox.Spec.PodTemplate.Spec.Volumes {
+		if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == claimName {
+			foundClaim = true
+			break
+		}
+	}
+	if !foundClaim {
+		t.Errorf("expected created sandbox to mount %s, got volumes: %+v", claimName, createdSandbox.Spec.PodTemplate.Spec.Volumes)
 	}
 }
 
@@ -2418,6 +2714,12 @@ type cancellingChatClient struct {
 func (c *cancellingChatClient) CreateChatCompletion(ctx context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
 	c.cancelFn()
 	return nil, context.Canceled
+}
+
+type failingChatClient struct{}
+
+func (f *failingChatClient) CreateChatCompletion(ctx context.Context, req llm.ChatCompletionRequest) (*llm.ChatCompletionResponse, error) {
+	return nil, errors.New("simulated LLM failure")
 }
 
 func TestOrchestrator_ContextCancelled_LeavesWorking(t *testing.T) {
@@ -5943,8 +6245,8 @@ func TestOrchestrator_HandleMap_EmptyAfterTerminalTransition(t *testing.T) {
 			t.Fatalf("PutRun: %v", err)
 		}
 
-		// Intentionally do not create sandbox so it fails with expired/deleted
-		harness, _, _ := setupTestHarnessWithLLM(t, nil, &llm.ElizaClient{})
+		// Use failing LLM so session fails
+		harness, _, _ := setupTestHarnessWithLLM(t, nil, &failingChatClient{})
 		orch := newTestOrchestrator(t, OrchestratorOptions{
 			Store:        store,
 			SessionStore: sessionStore,
@@ -6656,7 +6958,7 @@ func TestOrchestrator_Session_NeverUpdatesSandboxShutdownTime(t *testing.T) {
 	}
 }
 
-func TestOrchestrator_Working_SandboxExpiredAtStart_ProducesSandboxExpiredOutcome(t *testing.T) {
+func TestOrchestrator_Working_MissingOrExpiredSandboxAtStart_CarriesOn(t *testing.T) {
 	t.Run("already expired sandbox at worker start", func(t *testing.T) {
 		ctx := t.Context()
 		store := state.NewFileStore(t.TempDir())
@@ -6730,31 +7032,26 @@ func TestOrchestrator_Working_SandboxExpiredAtStart_ProducesSandboxExpiredOutcom
 			},
 		})
 
-		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
-			t.Logf("reconcileWorkingRun completed (errors handled)")
+		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
+			t.Fatalf("reconcileWorkingRun: %v", err)
 		}
 
-		failedRun, err := store.GetRun(ctx, repo.Key(), runID)
+		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
-		if failedRun.Phase != state.PhaseFailed {
-			t.Errorf("expected phase %s, got %s", state.PhaseFailed, failedRun.Phase)
+		if gotRun.Phase != state.PhaseNoImprovement {
+			t.Errorf("expected phase %s, got %s", state.PhaseNoImprovement, gotRun.Phase)
 		}
 
 		events, err := store.ReadEvents(ctx, repo.Key(), runID)
 		if err != nil {
 			t.Fatalf("ReadEvents: %v", err)
 		}
-		foundExpiredEvent := false
 		for _, e := range events {
-			if e.Kind == "sandbox_expired" && e.Phase == state.PhaseFailed {
-				foundExpiredEvent = true
-				break
+			if e.Kind == "sandbox_expired" {
+				t.Errorf("unexpected sandbox_expired event: %+v", e)
 			}
-		}
-		if !foundExpiredEvent {
-			t.Errorf("expected event kind sandbox_expired, got events: %+v", events)
 		}
 	})
 
@@ -6800,31 +7097,26 @@ func TestOrchestrator_Working_SandboxExpiredAtStart_ProducesSandboxExpiredOutcom
 			Harness:      harness,
 		})
 
-		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err == nil {
-			t.Logf("reconcileWorkingRun completed (errors handled)")
+		if _, err := reconcileWorkingRun(ctx, orch, runRequest(orch, repo.Key(), runID)); err != nil {
+			t.Fatalf("reconcileWorkingRun: %v", err)
 		}
 
-		failedRun, err := store.GetRun(ctx, repo.Key(), runID)
+		gotRun, err := store.GetRun(ctx, repo.Key(), runID)
 		if err != nil {
 			t.Fatalf("GetRun: %v", err)
 		}
-		if failedRun.Phase != state.PhaseFailed {
-			t.Errorf("expected phase %s, got %s", state.PhaseFailed, failedRun.Phase)
+		if gotRun.Phase != state.PhaseNoImprovement {
+			t.Errorf("expected phase %s, got %s", state.PhaseNoImprovement, gotRun.Phase)
 		}
 
 		events, err := store.ReadEvents(ctx, repo.Key(), runID)
 		if err != nil {
 			t.Fatalf("ReadEvents: %v", err)
 		}
-		foundExpiredEvent := false
 		for _, e := range events {
-			if e.Kind == "sandbox_expired" && e.Phase == state.PhaseFailed {
-				foundExpiredEvent = true
-				break
+			if e.Kind == "sandbox_expired" {
+				t.Errorf("unexpected sandbox_expired event: %+v", e)
 			}
-		}
-		if !foundExpiredEvent {
-			t.Errorf("expected event kind sandbox_expired, got events: %+v", events)
 		}
 	})
 }
@@ -7317,28 +7609,30 @@ func TestOrchestrator_Working_SandboxDeletedMidTurn(t *testing.T) {
 
 			select {
 			case <-blockingLLM.cancelled:
-			case <-time.After(5 * time.Second):
-				t.Fatal("expected worker context to be cancelled")
+				t.Fatal("worker context should not be cancelled on sandbox deletion")
+			default:
+			}
+
+			close(blockingLLM.release)
+			orch.workerWG.Wait()
+
+			if _, err := orch.Reconcile(ctx, runRequest(orch, repo.Key(), runID)); err != nil {
+				t.Fatalf("Reconcile after worker finish: %v", err)
 			}
 
 			gotRun, err := store.GetRun(ctx, repo.Key(), runID)
-			if err != nil || gotRun.Phase != state.PhaseFailed {
-				t.Fatalf("expected phase Failed, got %v (err %v)", gotRun.Phase, err)
+			if err != nil || gotRun.Phase != state.PhaseNoImprovement {
+				t.Fatalf("expected phase NoImprovement, got %v (err %v)", gotRun.Phase, err)
 			}
 
 			events, err := store.ReadEvents(ctx, repo.Key(), runID)
 			if err != nil {
 				t.Fatalf("ReadEvents: %v", err)
 			}
-			var foundEvent bool
 			for _, e := range events {
-				if e.Phase == state.PhaseFailed && e.Kind == "sandbox_deleted" && strings.Contains(e.Message, tc.wantMsg) {
-					foundEvent = true
-					break
+				if e.Kind == "sandbox_deleted" {
+					t.Errorf("unexpected sandbox_deleted event: %+v", e)
 				}
-			}
-			if !foundEvent {
-				t.Errorf("expected sandbox_deleted event mentioning %q, got events: %+v", tc.wantMsg, events)
 			}
 		})
 	}

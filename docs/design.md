@@ -243,12 +243,17 @@ We change the upstream example in five ways.
 - **Filesystem** operations use the sandboxd REST API for read, write, and
   list. The `geminicli-toolbox` binary provides glob, grep, and replace.
 - **Persistence** comes from the workspace volume. There is no snapshot step.
-  If the sandbox is recreated after expiry, node loss, or a resume for review
-  comments, the new pod mounts the same volume.
+  If the sandbox is recreated after expiry, node loss, deletion, or a resume for review
+  comments, the new pod mounts the same volume. A run's session gets its Sandbox
+  on demand: a Sandbox that disappears or fails during `Working` is not an event
+  that fails the run. The next tool call creates a Sandbox on demand (with the run's
+  labels, owner, and workspace claim, portal egress policy bound, repo clone present,
+  and git identity configured), and a tool call interrupted by sandbox loss is retried.
 - **Lifetime** is set once at creation to the run deadline plus a 15-minute
   grace period, and nothing extends it afterwards. The orchestrator deletes
-  the Sandbox when the run ends. `shutdownPolicy: Delete` is the safety net
-  when the control plane dies.
+  the Sandbox when the run ends. The run deadline remains the bound: a run past
+  its deadline ends as failed with `deadline_exceeded`. `shutdownPolicy: Delete` is the
+  safety net when the control plane dies.
 - **Model access** differs by session kind. The control plane calls the model
   with the platform keys for native sessions. Inner CLI agents inside the
   sandbox reach the model APIs through the portal sidecar.
@@ -406,7 +411,10 @@ Runs are reconciled in response to events:
      disappears or reports a failure before becoming ready, or if the ready
      deadline passes without the Sandbox becoming ready, the run transitions
      to `Failed`.
-3. **Working.** The session runs turn by turn in the sandbox. The orchestrator
+3. **Working.** The session runs turn by turn in the control plane, obtaining its
+   Sandbox on demand when tool calls execute. If a Sandbox is deleted or dies in the
+   middle of a turn, the interrupted tool call runs again in a new Sandbox on the same
+   workspace claim (or cloned anew if no claim is used) and the run carries on. The orchestrator
    ends the run at the deadline if it has not finished. The session ends
    when the agent calls the `finish` or `open_pull_request` tool, when the model
    stops, or when a run limit is reached. The limits are `maxDuration`,
