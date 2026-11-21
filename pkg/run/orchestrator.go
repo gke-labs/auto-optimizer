@@ -1048,97 +1048,38 @@ func (o *Orchestrator) waitForSandboxReady(ctx context.Context, repo *state.Repo
 	return sb, reconcile.Result{}, nil
 }
 
-// prepareReadySandbox configures a ready Sandbox for the run: binds the portal egress
-// policy if configured, clones or reuses the repo, and configures the git identity.
-// If portal binding fails before the ready deadline, it returns a reconcile.Result with RequeueAfter.
-// If any command fails or deadline expires, it cleans up and marks the run failed.
-func (o *Orchestrator) prepareReadySandbox(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox) (reconcile.Result, error) {
-	log := scoped.Log(ctx)
-	now := o.clock().UTC()
+// portalBindError marks a failure the caller may retry, because the portal can lag
+// behind the pod. Every other error from prepareSandbox is final for that Sandbox.
+type portalBindError struct {
+	err error
+}
 
+func (e *portalBindError) Error() string {
+	return e.err.Error()
+}
+
+func (e *portalBindError) Unwrap() error {
+	return e.err
+}
+
+// prepareSandbox executes the preparation steps on a ready Sandbox: binds portal egress
+// policy if configured, ensures the repository clone is present at the base commit,
+// and configures git identity. It is safe to call again on the same Sandbox.
+// It writes nothing to the run record and knows nothing about deadlines.
+func (o *Orchestrator) prepareSandbox(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox) error {
 	if sb == nil {
-		sb = o.harness.GetOrAttachSandbox(run.SandboxName)
-	}
-	if sb == nil {
-		run.ReadyDeadline = nil
-		return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, "failed to get sandbox handle")
+		return errors.New("sandbox handle is nil")
 	}
 
-	if o.portalBinder != nil && run.PortalBoundAt == nil {
-		policy, err := o.policyFactory(ctx, portal.PolicyRequest{
-			RepoURL:     repo.URL,
-			GoalName:    run.GoalName,
-			RunID:       run.ID,
-			SandboxName: run.SandboxName,
-		})
-		if err == nil {
-			var podUID types.UID
-			podUID, err = sb.PodUID(ctx)
-			if err == nil {
-				err = o.portalBinder.Bind(ctx, podUID, policy)
-			}
-		}
-		if err != nil {
-			log.Error(err, "failed to bind portal egress policy", "run", run.ID, "sandbox", run.SandboxName)
-			if run.ReadyDeadline != nil && !now.Before(*run.ReadyDeadline) {
-				run.ReadyDeadline = nil
-				o.finishRun(ctx, repo, run, runEnd{
-					Phase:   state.PhaseFailed,
-					Kind:    "portal_bind_failed",
-					Message: err.Error(),
-					Sandbox: sb,
-				})
-				return reconcile.Result{}, err
-			}
-
-			requeueAfter := portalBindRetryInterval
-			if run.ReadyDeadline != nil {
-				rem := run.ReadyDeadline.Sub(now)
-				if rem < requeueAfter {
-					requeueAfter = rem
-				}
-			}
-			if requeueAfter <= 0 {
-				requeueAfter = time.Millisecond
-			}
-			return reconcile.Result{RequeueAfter: requeueAfter}, nil
-		}
-
-		nowBound := o.clock().UTC()
-		run.PortalBoundAt = &nowBound
-		if err := o.putRun(ctx, repo, run, run.Phase); err != nil {
-			log.Error(err, "failed to update run with PortalBoundAt", "run", run.ID)
-		}
-
-		hosts := portal.PolicyHostnames(policy)
-		if hosts == nil {
-			hosts = []string{}
-		}
-		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
-			Time:    nowBound,
-			Phase:   run.Phase,
-			Kind:    "portal_bound",
-			Message: fmt.Sprintf("portal egress policy bound for hosts: %s", strings.Join(hosts, ", ")),
-			Data: map[string]any{
-				"hosts": append([]string(nil), hosts...),
-			},
-		}); err != nil {
-			log.Error(err, "failed to append portal_bound event", "run", run.ID)
-		}
-	}
-
-	failCommand := func(desc string, args []string, errMsg string, cmdTime time.Time, res *tools.ExecCommandResult) (reconcile.Result, error) {
-		log.Error(errors.New(errMsg), "command failed; deleting sandbox", "run", run.ID, "sandbox", run.SandboxName)
-
+	failCommand := func(desc string, args []string, errMsg string, cmdTime time.Time, res *tools.ExecCommandResult) error {
 		var exitCode int
 		var stdout, stderr string
 		if res != nil {
-			exitCode = res.ExitCode
+			exitCode = int(res.ExitCode)
 			stdout = res.Stdout
 			stderr = res.Stderr
 		}
 
-		// Record command failure event
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
 			Time:    cmdTime,
 			Phase:   run.Phase,
@@ -1153,16 +1094,48 @@ func (o *Orchestrator) prepareReadySandbox(ctx context.Context, repo *state.Repo
 				"stderr":    stderr,
 			},
 		}); err != nil {
-			log.Error(err, "failed to append command failure event", "run", run.ID)
+			scoped.Log(ctx).Error(err, "failed to append command failure event", "run", run.ID)
 		}
 
-		// Delete sandbox
-		if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
-			log.Error(delErr, "failed to delete sandbox after command failure", "sandbox", run.SandboxName)
+		return errors.New(errMsg)
+	}
+
+	if o.portalBinder != nil {
+		policy, err := o.policyFactory(ctx, portal.PolicyRequest{
+			RepoURL:     repo.URL,
+			GoalName:    run.GoalName,
+			RunID:       run.ID,
+			SandboxName: run.SandboxName,
+		})
+		if err != nil {
+			return &portalBindError{err: err}
+		}
+		podUID, err := sb.PodUID(ctx)
+		if err != nil {
+			return &portalBindError{err: err}
+		}
+		if err := o.portalBinder.Bind(ctx, podUID, policy); err != nil {
+			return &portalBindError{err: err}
 		}
 
-		run.ReadyDeadline = nil
-		return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, errMsg)
+		if run.PortalBoundAt == nil {
+			hosts := portal.PolicyHostnames(policy)
+			if hosts == nil {
+				hosts = []string{}
+			}
+			nowBound := o.clock().UTC()
+			if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
+				Time:    nowBound,
+				Phase:   run.Phase,
+				Kind:    "portal_bound",
+				Message: fmt.Sprintf("portal egress policy bound for hosts: %s", strings.Join(hosts, ", ")),
+				Data: map[string]any{
+					"hosts": append([]string(nil), hosts...),
+				},
+			}); err != nil {
+				scoped.Log(ctx).Error(err, "failed to append portal_bound event", "run", run.ID)
+			}
+		}
 	}
 
 	checkDesc := "git -C /workspace/repo rev-parse --git-dir"
@@ -1198,7 +1171,7 @@ func (o *Orchestrator) prepareReadySandbox(ctx context.Context, repo *state.Repo
 			Message: fmt.Sprintf("Workspace reused in sandbox %s", run.SandboxName),
 			Data:    map[string]any{"sandbox": run.SandboxName},
 		}); err != nil {
-			log.Error(err, "failed to append workspace_reused event", "run", run.ID)
+			scoped.Log(ctx).Error(err, "failed to append workspace_reused event", "run", run.ID)
 		}
 	} else {
 		commands := []struct {
@@ -1216,7 +1189,7 @@ func (o *Orchestrator) prepareReadySandbox(ctx context.Context, repo *state.Repo
 		}
 
 		for _, cmd := range commands {
-			log.Info("executing command inside sandbox", "run", run.ID, "cmd", cmd.desc)
+			scoped.Log(ctx).Info("executing command inside sandbox", "run", run.ID, "cmd", cmd.desc)
 
 			res, execErr := sb.ExecCommand(ctx, tools.ExecCommandOptions{
 				Command: cmd.args,
@@ -1256,22 +1229,14 @@ func (o *Orchestrator) prepareReadySandbox(ctx context.Context, repo *state.Repo
 					"stderr":    res.Stderr,
 				},
 			}); err != nil {
-				log.Error(err, "failed to append command success event", "run", run.ID)
+				scoped.Log(ctx).Error(err, "failed to append command success event", "run", run.ID)
 			}
 		}
 	}
 
 	if o.gitAuthor != "" {
 		if err := sb.ConfigureGitIdentity(ctx, "/workspace/repo", o.gitAuthor); err != nil {
-			log.Error(err, "failed to configure git identity; deleting sandbox", "run", run.ID, "sandbox", run.SandboxName)
-
-			// Delete sandbox
-			if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
-				log.Error(delErr, "failed to delete sandbox after command failure", "sandbox", run.SandboxName)
-			}
-
-			run.ReadyDeadline = nil
-			return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, err.Error())
+			return err
 		}
 
 		if err := o.store.AppendEvent(ctx, repo.Key(), run.ID, state.Event{
@@ -1281,7 +1246,72 @@ func (o *Orchestrator) prepareReadySandbox(ctx context.Context, repo *state.Repo
 			Message: fmt.Sprintf("git identity configured: %s", o.gitAuthor),
 			Data:    map[string]any{"author": o.gitAuthor},
 		}); err != nil {
-			log.Error(err, "failed to append git_identity_configured event", "run", run.ID)
+			scoped.Log(ctx).Error(err, "failed to append git_identity_configured event", "run", run.ID)
+		}
+	}
+
+	return nil
+}
+
+// prepareReadySandbox configures a ready Sandbox for the run: binds the portal egress
+// policy if configured, clones or reuses the repo, and configures the git identity.
+// If portal binding fails before the ready deadline, it returns a reconcile.Result with RequeueAfter.
+// If any command fails or deadline expires, it cleans up and marks the run failed.
+func (o *Orchestrator) prepareReadySandbox(ctx context.Context, repo *state.Repo, run *state.Run, sb *session.Sandbox) (reconcile.Result, error) {
+	log := scoped.Log(ctx)
+	now := o.clock().UTC()
+
+	if sb == nil {
+		sb = o.harness.GetOrAttachSandbox(run.SandboxName)
+	}
+	if sb == nil {
+		run.ReadyDeadline = nil
+		return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, "failed to get sandbox handle")
+	}
+
+	err := o.prepareSandbox(ctx, repo, run, sb)
+	if err != nil {
+		var pErr *portalBindError
+		if errors.As(err, &pErr) {
+			log.Error(pErr.err, "failed to bind portal egress policy", "run", run.ID, "sandbox", run.SandboxName)
+			if run.ReadyDeadline != nil && !now.Before(*run.ReadyDeadline) {
+				run.ReadyDeadline = nil
+				o.finishRun(ctx, repo, run, runEnd{
+					Phase:   state.PhaseFailed,
+					Kind:    "portal_bind_failed",
+					Message: pErr.err.Error(),
+					Sandbox: sb,
+				})
+				return reconcile.Result{}, pErr.err
+			}
+
+			requeueAfter := portalBindRetryInterval
+			if run.ReadyDeadline != nil {
+				rem := run.ReadyDeadline.Sub(now)
+				if rem < requeueAfter {
+					requeueAfter = rem
+				}
+			}
+			if requeueAfter <= 0 {
+				requeueAfter = time.Millisecond
+			}
+			return reconcile.Result{RequeueAfter: requeueAfter}, nil
+		}
+
+		log.Error(err, "command failed; deleting sandbox", "run", run.ID, "sandbox", run.SandboxName)
+		if delErr := o.harness.DeleteSandbox(context.WithoutCancel(ctx), sb); delErr != nil {
+			log.Error(delErr, "failed to delete sandbox after command failure", "sandbox", run.SandboxName)
+		}
+
+		run.ReadyDeadline = nil
+		return reconcile.Result{}, o.failRunWithEvent(ctx, repo, run, err.Error())
+	}
+
+	if o.portalBinder != nil && run.PortalBoundAt == nil {
+		nowBound := o.clock().UTC()
+		run.PortalBoundAt = &nowBound
+		if err := o.putRun(ctx, repo, run, run.Phase); err != nil {
+			log.Error(err, "failed to update run with PortalBoundAt", "run", run.ID)
 		}
 	}
 

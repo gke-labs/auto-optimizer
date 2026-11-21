@@ -784,6 +784,42 @@ func TestOrchestrator_WorkspaceReuse(t *testing.T) {
 		}
 	})
 
+	t.Run("prepareSandbox is safe to call again on the same sandbox", func(t *testing.T) {
+		procSrv := &mockProcessServer{}
+		orch, _, _, repo, run := setupReadyRun(t, "run-prepare-twice", procSrv)
+		sb := orch.harness.GetOrAttachSandbox(run.SandboxName)
+		if sb == nil {
+			t.Fatalf("expected sandbox handle, got nil")
+		}
+
+		if err := orch.prepareSandbox(t.Context(), repo, run, sb); err != nil {
+			t.Fatalf("first prepareSandbox: %v", err)
+		}
+
+		// Simulate the workspace now being populated
+		procSrv.mu.Lock()
+		procSrv.workspaceReused = true
+		procSrv.commands = nil
+		procSrv.mu.Unlock()
+
+		if err := orch.prepareSandbox(t.Context(), repo, run, sb); err != nil {
+			t.Fatalf("second prepareSandbox: %v", err)
+		}
+
+		procSrv.mu.Lock()
+		cmds := procSrv.commands
+		procSrv.mu.Unlock()
+		if len(cmds) != 3 {
+			t.Fatalf("expected 3 commands on second call (rev-parse, 2 git config), got %d: %+v", len(cmds), cmds)
+		}
+		for _, cmd := range cmds[1:] {
+			cmdStr := strings.Join(cmd, " ")
+			if strings.Contains(cmdStr, "clone") || strings.Contains(cmdStr, "checkout") {
+				t.Errorf("clone or checkout should have been skipped on second call, got command: %s", cmdStr)
+			}
+		}
+	})
+
 	t.Run("check failure fails step", func(t *testing.T) {
 		procSrv := &mockProcessServer{err: errors.New("sandbox process error")}
 		orch, store, agentsCS, repo, run := setupReadyRun(t, "run-checkfail", procSrv)
