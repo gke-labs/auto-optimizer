@@ -67,7 +67,7 @@ func TestFileStore(t *testing.T) {
 	if diff := cmp.Diff([]llm.Message{msg1}, msgs); diff != "" {
 		t.Errorf("messages mismatch (-want +got):\n%s", diff)
 	}
-	if meta == nil || *meta != (Metadata{}) {
+	if meta == nil || !meta.IsZero() {
 		t.Errorf("expected empty metadata when only messages exist, got %+v", meta)
 	}
 
@@ -113,7 +113,7 @@ func TestFileStore(t *testing.T) {
 	if diff := cmp.Diff(wantMsgs, msgs); diff != "" {
 		t.Errorf("messages mismatch (-want +got):\n%s", diff)
 	}
-	if meta == nil || *meta != (Metadata{}) {
+	if meta == nil || !meta.IsZero() {
 		t.Errorf("expected empty metadata when only messages exist, got %+v", meta)
 	}
 }
@@ -132,7 +132,7 @@ func TestFileStoreMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSession(legacy): %v", err)
 	}
-	if legacyMeta == nil || *legacyMeta != (Metadata{}) {
+	if legacyMeta == nil || !legacyMeta.IsZero() {
 		t.Errorf("LoadSession(legacy) metadata = %+v, want empty Metadata", legacyMeta)
 	}
 
@@ -322,5 +322,77 @@ func TestSession_CutOffRecovery(t *testing.T) {
 	}
 	if len(gotNormal) != 4 || *gotNormal[0].Content != content1 || *gotNormal[1].Content != content2 || *gotNormal[2].Content != content3 || *gotNormal[3].Content != content4 {
 		t.Fatalf("expected [m1, m2, m3, m4], got %+v", gotNormal)
+	}
+}
+
+func TestMetadataDepth(t *testing.T) {
+	ctx := t.Context()
+	store := NewFileStore(t.TempDir())
+
+	tests := []struct {
+		name      string
+		meta      Metadata
+		wantDepth int
+	}{
+		{
+			name:      "top-level session with empty parent and empty ancestors",
+			meta:      Metadata{},
+			wantDepth: 0,
+		},
+		{
+			name:      "child session with ancestors",
+			meta:      Metadata{Parent: "root", Ancestors: []string{"root"}},
+			wantDepth: 1,
+		},
+		{
+			name:      "grandchild session with ancestors",
+			meta:      Metadata{Parent: "child", Ancestors: []string{"root", "child"}},
+			wantDepth: 2,
+		},
+		{
+			name:      "great-grandchild session with ancestors",
+			meta:      Metadata{Parent: "grandchild", Ancestors: []string{"root", "child", "grandchild"}},
+			wantDepth: 3,
+		},
+		{
+			name:      "legacy session with parent only",
+			meta:      Metadata{Parent: "root"},
+			wantDepth: 1,
+		},
+		{
+			name:      "legacy top-level session with empty parent",
+			meta:      Metadata{Parent: ""},
+			wantDepth: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.meta.Depth(); got != tc.wantDepth {
+				t.Errorf("Metadata.Depth() = %d, want %d", got, tc.wantDepth)
+			}
+		})
+	}
+
+	// Verify persistence and round-tripping of Ancestors in FileStore.
+	wantMeta := Metadata{
+		Parent:    "child1",
+		Ancestors: []string{"root", "child1"},
+		Toolset:   "basic",
+		CreatedAt: time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC),
+	}
+	if err := store.NewSession(ctx, "roundtrip", wantMeta); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+
+	_, loadedMeta, err := store.LoadSession(ctx, "roundtrip")
+	if err != nil {
+		t.Fatalf("LoadSession: %v", err)
+	}
+	if diff := cmp.Diff(wantMeta, *loadedMeta); diff != "" {
+		t.Errorf("Metadata roundtrip mismatch (-want +got):\n%s", diff)
+	}
+	if loadedMeta.Depth() != 2 {
+		t.Errorf("loadedMeta.Depth() = %d, want 2", loadedMeta.Depth())
 	}
 }

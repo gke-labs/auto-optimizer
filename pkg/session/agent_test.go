@@ -248,7 +248,7 @@ func TestNewAndLoadSession_Metadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSession (legacy): %v", err)
 	}
-	if legacy.Metadata != (Metadata{}) {
+	if !legacy.Metadata.IsZero() {
 		t.Errorf("legacy metadata = %+v, want zero", legacy.Metadata)
 	}
 	if _, err := harness.NewSession(ctx, store, "legacy", Metadata{Toolset: "basic"}); err == nil {

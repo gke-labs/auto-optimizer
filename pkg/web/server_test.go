@@ -32,6 +32,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	sessionv1 "github.com/gke-labs/auto-optimizer/api/session/v1"
 	"github.com/gke-labs/auto-optimizer/pkg/goals"
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 	"github.com/gke-labs/auto-optimizer/pkg/run"
@@ -695,6 +696,127 @@ func TestTranscriptTruncation_UTF8(t *testing.T) {
 	}
 	if !strings.Contains(fullBody, `href="/sessions/utf8-session"`) {
 		t.Errorf("expected 'show less' link in full body")
+	}
+}
+
+func TestSessionDetail_MissingAncestorRenders(t *testing.T) {
+	ctx := t.Context()
+	storeDir := t.TempDir()
+	store := session.NewFileStore(storeDir)
+
+	llmClient, err := llm.NewFromEnv("fake-eliza")
+	if err != nil {
+		t.Fatalf("llm.NewFromEnv: %v", err)
+	}
+	toolset, err := toolsets.Get("basic")
+	if err != nil {
+		t.Fatalf("toolsets.Get: %v", err)
+	}
+	toolsRegistry := tools.NewRegistry()
+	toolsRegistry.ToolTimeout = session.DefaultToolTimeout
+	toolset.RegisterTools(toolsRegistry)
+
+	var opts session.RunOptions
+	opts.InitDefaults()
+	opts.ModelName = "fake-eliza"
+	opts.SystemPrompt = toolset.SystemPrompt()
+
+	harness := session.NewHarness(llmClient, nil, toolsRegistry, opts)
+	srv, err := sessionapi.NewServer(sessionapi.ServerOptions{
+		Store:          store,
+		DefaultToolset: "basic",
+		Harness:        harness,
+	})
+	if err != nil {
+		t.Fatalf("sessionapi.NewServer: %v", err)
+	}
+
+	// 1. Create a chain: root -> child -> grandchild
+	if err := srv.CreateNewSession(ctx, "root", "basic"); err != nil {
+		t.Fatalf("CreateNewSession(root): %v", err)
+	}
+	if _, err := srv.CreateSession(ctx, &sessionv1.CreateSessionRequest{
+		Name:    "child",
+		Parent:  "root",
+		Toolset: "basic",
+	}); err != nil {
+		t.Fatalf("CreateSession(child): %v", err)
+	}
+	if _, err := srv.CreateSession(ctx, &sessionv1.CreateSessionRequest{
+		Name:    "grandchild",
+		Parent:  "child",
+		Toolset: "basic",
+	}); err != nil {
+		t.Fatalf("CreateSession(grandchild): %v", err)
+	}
+
+	// 2. Delete root and child ancestor sessions from the store.
+	if err := os.RemoveAll(filepath.Join(storeDir, "root")); err != nil {
+		t.Fatalf("RemoveAll(root): %v", err)
+	}
+	if err := os.RemoveAll(filepath.Join(storeDir, "child")); err != nil {
+		t.Fatalf("RemoveAll(child): %v", err)
+	}
+
+	// 3. Start web server backed by a new sessionapi server (so activeSessions does not cache them).
+	freshSrv, err := sessionapi.NewServer(sessionapi.ServerOptions{
+		Store:          store,
+		DefaultToolset: "basic",
+		Harness:        harness,
+	})
+	if err != nil {
+		t.Fatalf("sessionapi.NewServer(fresh): %v", err)
+	}
+
+	webServer, err := NewServer(freshSrv, nil, nil, ServerOptions{})
+	if err != nil {
+		t.Fatalf("web.NewServer: %v", err)
+	}
+	ts := httptest.NewServer(webServer)
+	t.Cleanup(ts.Close)
+
+	client := ts.Client()
+
+	// 4. GET /sessions/grandchild must render 200 OK (not 500 error).
+	resp, err := client.Get(ts.URL + "/sessions/grandchild")
+	if err != nil {
+		t.Fatalf("GET /sessions/grandchild: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("reading body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /sessions/grandchild status = %d, want 200 OK; body:\n%s", resp.StatusCode, string(body))
+	}
+	if !strings.Contains(string(body), "grandchild") {
+		t.Errorf("expected 'grandchild' in response body")
+	}
+
+	// 5. Also test a legacy session where parent was recorded but ancestor does not exist.
+	legacyDir := filepath.Join(storeDir, "legacymissing")
+	if err := os.MkdirAll(legacyDir, 0700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "metadata.json"), []byte(`{"parent":"goneparent","toolset":"basic"}`), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	respLegacy, err := client.Get(ts.URL + "/sessions/legacymissing")
+	if err != nil {
+		t.Fatalf("GET /sessions/legacymissing: %v", err)
+	}
+	bodyLegacy, err := io.ReadAll(respLegacy.Body)
+	_ = respLegacy.Body.Close()
+	if err != nil {
+		t.Fatalf("reading body: %v", err)
+	}
+	if respLegacy.StatusCode != http.StatusOK {
+		t.Fatalf("GET /sessions/legacymissing status = %d, want 200 OK; body:\n%s", respLegacy.StatusCode, string(bodyLegacy))
+	}
+	if !strings.Contains(string(bodyLegacy), "legacymissing") {
+		t.Errorf("expected 'legacymissing' in response body")
 	}
 }
 

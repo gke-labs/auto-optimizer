@@ -38,6 +38,13 @@ var ErrNotFound = errors.New("session not found")
 // Metadata describes a session beyond its message history: where it came
 // from and how it runs. It is written once, when the session is created.
 type Metadata struct {
+	// Ancestors holds the full chain of ancestor session names, from the
+	// top-level session down to the parent. A session's depth is the length
+	// of this chain. For sessions written before this field was recorded
+	// (which have only Parent), Ancestors is empty; their depth is reported
+	// as 1 if Parent is set, or 0 if Parent is empty.
+	Ancestors []string `json:"ancestors,omitempty"`
+
 	// Parent is the name of the session that created this one, or "" for a
 	// top-level session (one started by a user rather than by another
 	// session).
@@ -56,6 +63,26 @@ type Metadata struct {
 
 	// CreatedAt is when the session was created.
 	CreatedAt time.Time `json:"createdAt"`
+}
+
+// Depth returns the session's depth in the session tree.
+// For top-level sessions, depth is 0. For child sessions with Ancestors,
+// depth is len(Ancestors). For sessions written before Ancestors was
+// recorded (which have only Parent), depth is reported as 1 if Parent
+// is set, or 0 if Parent is empty.
+func (m Metadata) Depth() int {
+	if len(m.Ancestors) > 0 {
+		return len(m.Ancestors)
+	}
+	if m.Parent != "" {
+		return 1
+	}
+	return 0
+}
+
+// IsZero reports whether m is an empty Metadata.
+func (m Metadata) IsZero() bool {
+	return len(m.Ancestors) == 0 && m.Parent == "" && m.Toolset == "" && m.Repo == "" && m.RunID == "" && m.CreatedAt.IsZero()
 }
 
 // SessionSummary describes a session's metadata and message count.

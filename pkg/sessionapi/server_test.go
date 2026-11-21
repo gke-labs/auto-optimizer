@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1145,48 +1146,275 @@ func TestCreateSessionAndSessionDepth_Errors(t *testing.T) {
 		t.Errorf("SessionDepth on nonexistent session got code %v, want NotFound (%v)", status.Code(err), err)
 	}
 
-	// 4. SessionDepth on session whose parent does not exist returns NotFound.
-	missingParentDir := filepath.Join(storeDir, "brokenchild")
-	if err := os.MkdirAll(missingParentDir, 0700); err != nil {
-		t.Fatalf("MkdirAll(brokenchild): %v", err)
+	// 4. SessionDepth on invalid session name returns InvalidArgument.
+	if _, err := srv.SessionDepth(ctx, "invalid name!"); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("SessionDepth on invalid session name got code %v, want InvalidArgument (%v)", status.Code(err), err)
 	}
-	if err := os.WriteFile(filepath.Join(missingParentDir, "metadata.json"), []byte(`{"parent":"missingancestor"}`), 0600); err != nil {
-		t.Fatalf("WriteFile(brokenchild metadata): %v", err)
+}
+
+func TestSessionAncestryAndMissingAncestor(t *testing.T) {
+	ctx := t.Context()
+
+	llmClient, err := llm.NewFromEnv("fake-eliza")
+	if err != nil {
+		t.Fatalf("llm.NewFromEnv: %v", err)
 	}
-	if _, err := srv.SessionDepth(ctx, "brokenchild"); status.Code(err) != codes.NotFound {
-		t.Errorf("SessionDepth with missing ancestor got code %v, want NotFound (%v)", status.Code(err), err)
+	toolset, err := toolsets.Get("basic")
+	if err != nil {
+		t.Fatalf("toolsets.Get: %v", err)
+	}
+	toolsRegistry := tools.NewRegistry()
+	toolsRegistry.ToolTimeout = session.DefaultToolTimeout
+	toolset.RegisterTools(toolsRegistry)
+
+	var opts session.RunOptions
+	opts.InitDefaults()
+	opts.ModelName = "fake-eliza"
+	opts.SystemPrompt = toolset.SystemPrompt()
+	harness := session.NewHarness(llmClient, nil, toolsRegistry, opts)
+
+	storeDir := t.TempDir()
+	sessionStore := session.NewFileStore(storeDir)
+
+	srv, err := NewServer(ServerOptions{
+		Store:          sessionStore,
+		DefaultToolset: "basic",
+		Harness:        harness,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
 	}
 
-	// 5. SessionDepth on cycle returns an error.
-	cycleDirA := filepath.Join(storeDir, "cyclea")
-	cycleDirB := filepath.Join(storeDir, "cycleb")
-	if err := os.MkdirAll(cycleDirA, 0700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	if err := os.MkdirAll(cycleDirB, 0700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(cycleDirA, "metadata.json"), []byte(`{"parent":"cycleb"}`), 0600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(cycleDirB, "metadata.json"), []byte(`{"parent":"cyclea"}`), 0600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
+	// 1. Top-level session: depth 0, empty ancestors.
+	topLevel := "topsession"
+	if _, err := srv.CreateSession(ctx, &sessionv1.CreateSessionRequest{
+		Name:    topLevel,
+		Toolset: "basic",
+	}); err != nil {
+		t.Fatalf("CreateSession(top): %v", err)
 	}
 
-	if _, err := srv.SessionDepth(ctx, "cyclea"); err == nil {
-		t.Error("SessionDepth on cyclic hierarchy should return an error, got nil")
+	_, topMeta, err := sessionStore.LoadSession(ctx, topLevel)
+	if err != nil {
+		t.Fatalf("LoadSession(top): %v", err)
+	}
+	if len(topMeta.Ancestors) != 0 {
+		t.Errorf("top-level Ancestors = %v, want empty", topMeta.Ancestors)
+	}
+	if topMeta.Parent != "" {
+		t.Errorf("top-level Parent = %q, want empty", topMeta.Parent)
 	}
 
-	// 6. SessionDepth on self-parent cycle returns an error.
-	selfDir := filepath.Join(storeDir, "selfcycle")
-	if err := os.MkdirAll(selfDir, 0700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
+	topDepth, err := srv.SessionDepth(ctx, topLevel)
+	if err != nil {
+		t.Fatalf("SessionDepth(top): %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(selfDir, "metadata.json"), []byte(`{"parent":"selfcycle"}`), 0600); err != nil {
-		t.Fatalf("WriteFile: %v", err)
+	if topDepth != 0 {
+		t.Errorf("SessionDepth(top) = %d, want 0", topDepth)
 	}
 
-	if _, err := srv.SessionDepth(ctx, "selfcycle"); err == nil {
-		t.Error("SessionDepth on self-cycle should return an error, got nil")
+	topDetail, err := srv.GetSessionDetail(ctx, topLevel)
+	if err != nil {
+		t.Fatalf("GetSessionDetail(top): %v", err)
+	}
+	if topDetail.Summary.Depth != 0 {
+		t.Errorf("GetSessionDetail(top) depth = %d, want 0", topDetail.Summary.Depth)
+	}
+	if len(topDetail.Summary.Ancestors) != 0 {
+		t.Errorf("GetSessionDetail(top) ancestors = %v, want empty", topDetail.Summary.Ancestors)
+	}
+
+	// 2. Child session: depth 1, ancestors [topLevel].
+	child := "childsession"
+	if _, err := srv.CreateSession(ctx, &sessionv1.CreateSessionRequest{
+		Name:    child,
+		Parent:  topLevel,
+		Toolset: "basic",
+	}); err != nil {
+		t.Fatalf("CreateSession(child): %v", err)
+	}
+
+	_, childMeta, err := sessionStore.LoadSession(ctx, child)
+	if err != nil {
+		t.Fatalf("LoadSession(child): %v", err)
+	}
+	wantChildAncestors := []string{topLevel}
+	if !slices.Equal(childMeta.Ancestors, wantChildAncestors) {
+		t.Errorf("child Ancestors = %v, want %v", childMeta.Ancestors, wantChildAncestors)
+	}
+	if childMeta.Parent != topLevel {
+		t.Errorf("child Parent = %q, want %q", childMeta.Parent, topLevel)
+	}
+
+	childDepth, err := srv.SessionDepth(ctx, child)
+	if err != nil {
+		t.Fatalf("SessionDepth(child): %v", err)
+	}
+	if childDepth != 1 {
+		t.Errorf("SessionDepth(child) = %d, want 1", childDepth)
+	}
+
+	childDetail, err := srv.GetSessionDetail(ctx, child)
+	if err != nil {
+		t.Fatalf("GetSessionDetail(child): %v", err)
+	}
+	if childDetail.Summary.Depth != 1 {
+		t.Errorf("GetSessionDetail(child) depth = %d, want 1", childDetail.Summary.Depth)
+	}
+	if !slices.Equal(childDetail.Summary.Ancestors, wantChildAncestors) {
+		t.Errorf("GetSessionDetail(child) ancestors = %v, want %v", childDetail.Summary.Ancestors, wantChildAncestors)
+	}
+
+	// 3. Grandchild session: depth 2, ancestors [topLevel, child].
+	grandchild := "grandchildsession"
+	if _, err := srv.CreateSession(ctx, &sessionv1.CreateSessionRequest{
+		Name:    grandchild,
+		Parent:  child,
+		Toolset: "basic",
+	}); err != nil {
+		t.Fatalf("CreateSession(grandchild): %v", err)
+	}
+
+	_, grandchildMeta, err := sessionStore.LoadSession(ctx, grandchild)
+	if err != nil {
+		t.Fatalf("LoadSession(grandchild): %v", err)
+	}
+	wantGrandchildAncestors := []string{topLevel, child}
+	if !slices.Equal(grandchildMeta.Ancestors, wantGrandchildAncestors) {
+		t.Errorf("grandchild Ancestors = %v, want %v", grandchildMeta.Ancestors, wantGrandchildAncestors)
+	}
+	if grandchildMeta.Parent != child {
+		t.Errorf("grandchild Parent = %q, want %q", grandchildMeta.Parent, child)
+	}
+
+	grandchildDepth, err := srv.SessionDepth(ctx, grandchild)
+	if err != nil {
+		t.Fatalf("SessionDepth(grandchild): %v", err)
+	}
+	if grandchildDepth != 2 {
+		t.Errorf("SessionDepth(grandchild) = %d, want 2", grandchildDepth)
+	}
+
+	grandchildDetail, err := srv.GetSessionDetail(ctx, grandchild)
+	if err != nil {
+		t.Fatalf("GetSessionDetail(grandchild): %v", err)
+	}
+	if grandchildDetail.Summary.Depth != 2 {
+		t.Errorf("GetSessionDetail(grandchild) depth = %d, want 2", grandchildDetail.Summary.Depth)
+	}
+	if !slices.Equal(grandchildDetail.Summary.Ancestors, wantGrandchildAncestors) {
+		t.Errorf("GetSessionDetail(grandchild) ancestors = %v, want %v", grandchildDetail.Summary.Ancestors, wantGrandchildAncestors)
+	}
+
+	// 4. Session whose ancestors no longer exist.
+	// Delete ancestor sessions topLevel and child from the underlying store.
+	if err := os.RemoveAll(filepath.Join(storeDir, topLevel)); err != nil {
+		t.Fatalf("RemoveAll(top): %v", err)
+	}
+	if err := os.RemoveAll(filepath.Join(storeDir, child)); err != nil {
+		t.Fatalf("RemoveAll(child): %v", err)
+	}
+
+	// Create a new server without activeSessions in memory to ensure loading from store.
+	srvFromDisk, err := NewServer(ServerOptions{
+		Store:          sessionStore,
+		DefaultToolset: "basic",
+		Harness:        harness,
+	})
+	if err != nil {
+		t.Fatalf("NewServer(fromDisk): %v", err)
+	}
+
+	// SessionDepth and GetSessionDetail must succeed even though ancestors were deleted.
+	missingAncestorDepth, err := srvFromDisk.SessionDepth(ctx, grandchild)
+	if err != nil {
+		t.Fatalf("SessionDepth with missing ancestors should succeed, got error: %v", err)
+	}
+	if missingAncestorDepth != 2 {
+		t.Errorf("SessionDepth with missing ancestors = %d, want 2", missingAncestorDepth)
+	}
+
+	missingAncestorDetail, err := srvFromDisk.GetSessionDetail(ctx, grandchild)
+	if err != nil {
+		t.Fatalf("GetSessionDetail with missing ancestors should succeed, got error: %v", err)
+	}
+	if missingAncestorDetail.Summary.Depth != 2 {
+		t.Errorf("GetSessionDetail with missing ancestors depth = %d, want 2", missingAncestorDetail.Summary.Depth)
+	}
+	if !slices.Equal(missingAncestorDetail.Summary.Ancestors, wantGrandchildAncestors) {
+		t.Errorf("GetSessionDetail with missing ancestors ancestors = %v, want %v", missingAncestorDetail.Summary.Ancestors, wantGrandchildAncestors)
+	}
+
+	// 5. Legacy session written before this change (only Parent recorded, no Ancestors).
+	legacyChildDir := filepath.Join(storeDir, "legacychild")
+	if err := os.MkdirAll(legacyChildDir, 0700); err != nil {
+		t.Fatalf("MkdirAll(legacychild): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyChildDir, "metadata.json"), []byte(`{"parent":"missingancestor","toolset":"basic"}`), 0600); err != nil {
+		t.Fatalf("WriteFile(legacychild): %v", err)
+	}
+
+	// Legacy child still loads.
+	legacyDetail, err := srvFromDisk.GetSessionDetail(ctx, "legacychild")
+	if err != nil {
+		t.Fatalf("GetSessionDetail(legacychild) should succeed, got error: %v", err)
+	}
+	if legacyDetail.Summary.Depth != 1 {
+		t.Errorf("legacychild depth = %d, want 1", legacyDetail.Summary.Depth)
+	}
+	if legacyDetail.Summary.Parent != "missingancestor" {
+		t.Errorf("legacychild parent = %q, want missingancestor", legacyDetail.Summary.Parent)
+	}
+
+	legacyDepth, err := srvFromDisk.SessionDepth(ctx, "legacychild")
+	if err != nil {
+		t.Fatalf("SessionDepth(legacychild) should succeed, got error: %v", err)
+	}
+	if legacyDepth != 1 {
+		t.Errorf("SessionDepth(legacychild) = %d, want 1", legacyDepth)
+	}
+
+	// Legacy child still lists.
+	summaries, err := srvFromDisk.ListSessionSummaries(ctx)
+	if err != nil {
+		t.Fatalf("ListSessionSummaries: %v", err)
+	}
+	var foundLegacy bool
+	for _, sum := range summaries {
+		if sum.Name == "legacychild" {
+			foundLegacy = true
+			if sum.Depth != 1 {
+				t.Errorf("legacychild summary depth = %d, want 1", sum.Depth)
+			}
+			if sum.Parent != "missingancestor" {
+				t.Errorf("legacychild summary parent = %q, want missingancestor", sum.Parent)
+			}
+		}
+	}
+	if !foundLegacy {
+		t.Error("legacychild not found in ListSessionSummaries")
+	}
+
+	// 6. Legacy top-level session (Parent is empty, Ancestors empty).
+	legacyTopDir := filepath.Join(storeDir, "legacytop")
+	if err := os.MkdirAll(legacyTopDir, 0700); err != nil {
+		t.Fatalf("MkdirAll(legacytop): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyTopDir, "metadata.json"), []byte(`{"toolset":"basic"}`), 0600); err != nil {
+		t.Fatalf("WriteFile(legacytop): %v", err)
+	}
+	legacyTopDetail, err := srvFromDisk.GetSessionDetail(ctx, "legacytop")
+	if err != nil {
+		t.Fatalf("GetSessionDetail(legacytop) should succeed, got error: %v", err)
+	}
+	if legacyTopDetail.Summary.Depth != 0 {
+		t.Errorf("legacytop depth = %d, want 0", legacyTopDetail.Summary.Depth)
+	}
+	legacyTopDepth, err := srvFromDisk.SessionDepth(ctx, "legacytop")
+	if err != nil {
+		t.Fatalf("SessionDepth(legacytop) should succeed, got error: %v", err)
+	}
+	if legacyTopDepth != 0 {
+		t.Errorf("SessionDepth(legacytop) = %d, want 0", legacyTopDepth)
 	}
 }

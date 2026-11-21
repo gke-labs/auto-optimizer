@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -44,6 +45,7 @@ type SessionSummary struct {
 	RunID        string
 	Toolset      string
 	Parent       string
+	Ancestors    []string
 	Depth        int
 	CreatedAt    time.Time
 	MessageCount int
@@ -187,6 +189,7 @@ func (s *Server) CreateSession(ctx context.Context, req *sessionv1.CreateSession
 
 	parent := req.GetParent()
 	var runID, repo string
+	var ancestors []string
 	if parent != "" {
 		parentMeta, err := s.lookupParent(ctx, parent)
 		if err != nil {
@@ -194,6 +197,7 @@ func (s *Server) CreateSession(ctx context.Context, req *sessionv1.CreateSession
 		}
 		runID = parentMeta.RunID
 		repo = parentMeta.Repo
+		ancestors = append(slices.Clone(parentMeta.Ancestors), parent)
 	}
 
 	harness, err := s.harnessFactory(toolset)
@@ -204,6 +208,7 @@ func (s *Server) CreateSession(ctx context.Context, req *sessionv1.CreateSession
 	meta := session.Metadata{
 		Toolset:   toolset,
 		Parent:    parent,
+		Ancestors: ancestors,
 		Repo:      repo,
 		RunID:     runID,
 		CreatedAt: time.Now(),
@@ -729,24 +734,6 @@ func (s *Server) getOrLoadSession(ctx context.Context, name string) (*session.Se
 	return sess, harness, nil
 }
 
-// computeSessionDepth calculates how deep a session is in the session tree.
-// A top-level session (with no parent) has depth 0.
-func computeSessionDepth(name string, sessionMetas map[string]session.Metadata) int {
-	depth := 0
-	curr := name
-	visited := make(map[string]bool)
-	for {
-		visited[curr] = true
-		parent := sessionMetas[curr].Parent
-		if parent == "" || visited[parent] {
-			break
-		}
-		depth++
-		curr = parent
-	}
-	return depth
-}
-
 // ListSessionSummaries returns summaries for all known sessions, ordered newest first.
 func (s *Server) ListSessionSummaries(ctx context.Context) ([]SessionSummary, error) {
 	summaries, err := s.store.ListSessions(ctx)
@@ -761,14 +748,6 @@ func (s *Server) ListSessionSummaries(ctx context.Context) ([]SessionSummary, er
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	sessionMetas := make(map[string]session.Metadata, len(summaries))
-	for _, sum := range summaries {
-		sessionMetas[sum.Name] = sum.Metadata
-	}
-	for name, act := range s.activeSessions {
-		sessionMetas[name] = act.Metadata
-	}
 
 	var result []SessionSummary
 	for _, sum := range summaries {
@@ -788,7 +767,8 @@ func (s *Server) ListSessionSummaries(ctx context.Context) ([]SessionSummary, er
 			RunID:        runID,
 			Toolset:      sum.Metadata.Toolset,
 			Parent:       sum.Metadata.Parent,
-			Depth:        computeSessionDepth(sum.Name, sessionMetas),
+			Ancestors:    sum.Metadata.Ancestors,
+			Depth:        sum.Metadata.Depth(),
 			CreatedAt:    sum.Metadata.CreatedAt,
 			MessageCount: msgCount,
 			InFlight:     s.busySessions[sum.Name],
@@ -886,11 +866,6 @@ func (s *Server) GetSessionDetail(ctx context.Context, name string) (*SessionDet
 		}
 	}
 
-	depth, err := s.SessionDepth(ctx, name)
-	if err != nil {
-		return nil, fmt.Errorf("getting session depth for %q: %w", name, err)
-	}
-
 	return &SessionDetail{
 		Summary: SessionSummary{
 			Name:         name,
@@ -898,7 +873,8 @@ func (s *Server) GetSessionDetail(ctx context.Context, name string) (*SessionDet
 			RunID:        runID,
 			Toolset:      meta.Toolset,
 			Parent:       meta.Parent,
-			Depth:        depth,
+			Ancestors:    meta.Ancestors,
+			Depth:        meta.Depth(),
 			CreatedAt:    meta.CreatedAt,
 			MessageCount: len(messages),
 			InFlight:     inFlight,
@@ -950,32 +926,17 @@ func (s *Server) ListRunSessions(ctx context.Context, runID string) ([]SessionSu
 
 // SessionDepth returns how deep the session is in the session tree.
 // A top-level session (with no parent) has depth 0.
-// It returns an error if the session or any ancestor does not exist,
-// or if a cycle is detected.
+// It returns NotFound if the session does not exist.
 func (s *Server) SessionDepth(ctx context.Context, name string) (int, error) {
 	if err := session.ValidateSessionName(name); err != nil {
 		return 0, status.Errorf(codes.InvalidArgument, "invalid session name %q: %v", name, err)
 	}
 
-	depth := 0
-	curr := name
-	visited := map[string]bool{curr: true}
-
-	for {
-		meta, err := s.sessionMetadata(ctx, curr)
-		if err != nil {
-			return 0, err
-		}
-		if meta.Parent == "" {
-			return depth, nil
-		}
-		if visited[meta.Parent] {
-			return 0, status.Errorf(codes.InvalidArgument, "cycle detected: session %q is its own ancestor", meta.Parent)
-		}
-		visited[meta.Parent] = true
-		depth++
-		curr = meta.Parent
+	meta, err := s.sessionMetadata(ctx, name)
+	if err != nil {
+		return 0, err
 	}
+	return meta.Depth(), nil
 }
 
 // StartTurn starts one agent turn asynchronously in the background.
