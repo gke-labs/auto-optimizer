@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package goals finds, parses, and validates goal definitions from Markdown files.
+// Package goals provides functions to find, parse, and validate goal definitions from Markdown files.
 package goals
 
 import (
@@ -30,29 +30,46 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-// Kind identifies whether a goal is a metric goal or a judged goal.
+// Kind identifies whether the orchestrator evaluates a goal using a metric command or maintainer judgment.
 type Kind string
 
 const (
-	// KindMetric indicates a goal with a metric command that is re-measured.
+	// KindMetric indicates a goal that the system evaluates by running and measuring a benchmark command.
 	KindMetric Kind = "metric"
-	// KindJudged indicates a goal evaluated by maintainer judgement without a metric command.
+	// KindJudged indicates a goal that a maintainer evaluates using judgment rather than an automated benchmark command.
 	KindJudged Kind = "judged"
 )
 
 // Goal represents a parsed and validated goal definition.
 type Goal struct {
-	Name     string   `json:"name"`
-	Body     string   `json:"body"`
-	Hash     string   `json:"hash"`
-	Metric   *Metric  `json:"metric,omitempty"`
-	Verify   string   `json:"verify,omitempty"`
-	Budget   *Budget  `json:"budget,omitempty"`
-	Schedule string   `json:"schedule,omitempty"`
-	Agents   []string `json:"agents,omitempty"`
+	// Name is the unique identifier of the goal.
+	// The package derives this identifier from the base name of the goal's definition file.
+	Name string `json:"name"`
+
+	// Body contains the raw Markdown content of the goal, excluding any front matter.
+	Body string `json:"body"`
+
+	// Hash is the SHA-256 content hash of the original goal file.
+	Hash string `json:"hash"`
+
+	// Metric specifies the parameters for benchmark measurement when evaluating a metric-based goal.
+	Metric *Metric `json:"metric,omitempty"`
+
+	// Verify is an optional command that validates a candidate solution.
+	Verify string `json:"verify,omitempty"`
+
+	// Budget sets the resource and time limits for the goal run.
+	Budget *Budget `json:"budget,omitempty"`
+
+	// Schedule determines how frequently the orchestrator triggers goal evaluation.
+	// Valid options include daily, weekly, on-change, and manual.
+	Schedule string `json:"schedule,omitempty"`
+
+	// Agents lists the names of the coding agents that can work on this goal.
+	Agents []string `json:"agents,omitempty"`
 }
 
-// Kind returns KindMetric if the goal has a Metric section, or KindJudged otherwise.
+// Kind returns KindMetric if the goal specifies a metric. Otherwise, it returns KindJudged.
 func (g *Goal) Kind() Kind {
 	if g.Metric != nil {
 		return KindMetric
@@ -60,20 +77,36 @@ func (g *Goal) Kind() Kind {
 	return KindJudged
 }
 
-// Metric defines benchmark measurement parameters for a metric goal.
+// Metric defines the benchmark measurement parameters for a metric goal.
 type Metric struct {
-	Command        string `json:"command"`
-	Direction      string `json:"direction"`
-	Unit           string `json:"unit,omitempty"`
+	// Command is the shell command that measures the metric.
+	Command string `json:"command"`
+
+	// Direction specifies whether a successful change increases or decreases the metric value.
+	// Valid values are "higher" or "lower".
+	Direction string `json:"direction"`
+
+	// Unit describes the measurement unit of the metric.
+	Unit string `json:"unit,omitempty"`
+
+	// MinImprovement is the minimum improvement that a candidate must achieve.
+	// This value can be an absolute number or a percentage.
 	MinImprovement string `json:"minImprovement,omitempty"`
-	Runs           int    `json:"runs,omitempty"`
-	Timeout        string `json:"timeout,omitempty"`
+
+	// Runs is the number of benchmark executions required to produce a stable measurement.
+	Runs int `json:"runs,omitempty"`
+
+	// Timeout is the maximum duration that a single benchmark execution can run before the system terminates it.
+	Timeout string `json:"timeout,omitempty"`
 }
 
-// Budget defines resource and time limits for a goal run.
+// Budget defines the resource and time limits that constrain a goal run.
 type Budget struct {
-	MaxDuration string  `json:"maxDuration,omitempty"`
-	MaxCostUSD  float64 `json:"maxCostUSD,omitempty"`
+	// MaxDuration is the maximum elapsed time that a goal run can take before the orchestrator terminates it.
+	MaxDuration string `json:"maxDuration,omitempty"`
+
+	// MaxCostUSD is the maximum monetary budget in US Dollars for LLM API usage during the run.
+	MaxCostUSD float64 `json:"maxCostUSD,omitempty"`
 }
 
 type rawGoal struct {
@@ -98,9 +131,10 @@ type rawBudget struct {
 	MaxCostUSD  *float64 `json:"maxCostUSD"`
 }
 
-// Parse takes the goal name (the file name without .md) and file contents,
-// parses optional YAML front matter, computes SHA-256 content hash, validates all fields,
-// and returns the Goal.
+// Parse processes a goal name and its raw file content to construct a validated Goal.
+// First, Parse validates that the goal name contains only safe characters.
+// Next, it computes a SHA-256 hash of the content for change tracking.
+// Finally, it extracts the optional YAML front matter, parses its configuration, and validates all fields.
 func Parse(name string, data []byte) (*Goal, error) {
 	if !isSafeGoalName(name) {
 		return nil, fmt.Errorf("goals: invalid goal name %q: must be safe in a branch name (lower-case letters, digits, '-', '_', '.')", name)
@@ -189,8 +223,9 @@ func Parse(name string, data []byte) (*Goal, error) {
 	return g, nil
 }
 
-// LoadDir reads every *.md file in a directory and returns goals sorted by name.
-// Non-Markdown files and directories are ignored.
+// LoadDir reads every Markdown file ending with the .md extension in the specified directory.
+// The function parses each file into a Goal and returns them sorted alphabetically by name.
+// LoadDir ignores directories and files that do not end with the .md extension.
 func LoadDir(fsys fs.FS, dir string) ([]*Goal, error) {
 	if dir == "" {
 		dir = "."
