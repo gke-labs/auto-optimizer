@@ -119,6 +119,8 @@ data:
   AO_GITHUB_ALLOWED_USERS: ""
   # Maximum number of session turns per run. Leave empty to use the server default.
   AO_MAX_TURNS: ""
+  # Git author identity for commits made in sandboxes, as Name <email>. Leave empty to use the server default.
+  AO_GIT_AUTHOR: ""
   PORTAL_CONTROLLER_ADDR: ""
   PORTAL_CONTROLLER_CA_FILE: "/etc/portal/tls.crt"
   PORTAL_TOKEN_FILE: "/var/run/secrets/portal/token"

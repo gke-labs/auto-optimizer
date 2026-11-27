@@ -176,6 +176,11 @@ func newServeCommandWithOptions(opts *serveOptions) *cobra.Command {
 					opts.orchestrator.MaxSessionDepth = v
 				}
 			}
+			if !cmd.Flags().Changed("git-author") {
+				if envGitAuthor := os.Getenv("AO_GIT_AUTHOR"); envGitAuthor != "" {
+					opts.git.Author = envGitAuthor
+				}
+			}
 			if err := opts.git.Validate(); err != nil {
 				return fmt.Errorf("invalid --git-author: %w", err)
 			}

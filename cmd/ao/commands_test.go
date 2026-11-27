@@ -257,6 +257,47 @@ func TestServeGitAuthorValidation(t *testing.T) {
 			t.Error("expected error for unparsable --git-author, got nil")
 		}
 	})
+
+	t.Run("AO_GIT_AUTHOR overrides default when flag unset", func(t *testing.T) {
+		t.Setenv("AO_GIT_AUTHOR", "Env Bot <env@example.com>")
+		var opts serveOptions
+		cmd := newServeCommandWithOptions(&opts)
+		if err := cmd.ParseFlags([]string{}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		if err := cmd.PreRunE(cmd, nil); err != nil {
+			t.Fatalf("PreRunE failed unexpectedly: %v", err)
+		}
+		if opts.git.Author != "Env Bot <env@example.com>" {
+			t.Errorf("git.Author = %q, want %q", opts.git.Author, "Env Bot <env@example.com>")
+		}
+	})
+
+	t.Run("flag overrides AO_GIT_AUTHOR", func(t *testing.T) {
+		t.Setenv("AO_GIT_AUTHOR", "Env Bot <env@example.com>")
+		var opts serveOptions
+		cmd := newServeCommandWithOptions(&opts)
+		if err := cmd.ParseFlags([]string{"--git-author", "Flag Bot <flag@example.com>"}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		if err := cmd.PreRunE(cmd, nil); err != nil {
+			t.Fatalf("PreRunE failed unexpectedly: %v", err)
+		}
+		if opts.git.Author != "Flag Bot <flag@example.com>" {
+			t.Errorf("git.Author = %q, want %q", opts.git.Author, "Flag Bot <flag@example.com>")
+		}
+	})
+
+	t.Run("invalid AO_GIT_AUTHOR rejected", func(t *testing.T) {
+		t.Setenv("AO_GIT_AUTHOR", "not-a-valid-address")
+		cmd := newServeCommand()
+		if err := cmd.ParseFlags([]string{}); err != nil {
+			t.Fatalf("ParseFlags: %v", err)
+		}
+		if err := cmd.PreRunE(cmd, nil); err == nil {
+			t.Error("expected error for invalid AO_GIT_AUTHOR, got nil")
+		}
+	})
 }
 
 func TestServePublicURLValidation(t *testing.T) {
