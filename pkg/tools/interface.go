@@ -23,52 +23,55 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/llm"
 )
 
-// Tool is the interface for all LLM-callable tools.
+// Tool defines the interface for all tools that an LLM can invoke.
 type Tool interface {
+	// Schema returns the schema of the tool, including its name, description, and parameters.
+	// The LLM uses this schema to understand how and when to invoke the tool.
 	Schema() llm.Tool
+
+	// Run executes the tool's action inside the provided sandbox and returns the result message.
 	Run(ctx context.Context, sandbox Sandbox) (llm.Message, error)
 }
 
-// Sandbox represents the interface for running commands in a sandbox.
+// Sandbox executes commands in an isolated environment.
 type Sandbox interface {
-	// ExecCommand executes a command inside the sandbox container with specified options.
-	// If Stdout or Stderr are nil in tools.ExecCommandOptions, they are captured internally and returned in the tools.ExecCommandResult.
-	// If the command returns a non-zero exit code, that is _not_ treated as an error; the exit code is returned in the result.
+	// ExecCommand runs a command inside the sandbox container using the specified options.
+	// When options omit Stdout or Stderr, ExecCommand captures those streams and returns them
+	// in the returned result. ExecCommand returns command exit codes in the result instead
+	// of returning them as errors.
 	ExecCommand(ctx context.Context, opts ExecCommandOptions) (*ExecCommandResult, error)
 }
 
-// ExecCommandResult holds the result of running a command in the sandbox.
+// ExecCommandResult holds the output and exit code from a run command.
 type ExecCommandResult struct {
-	// Stdout contains the captured standard output.
-	// This is only populated if ExecCommandOptions.Stdout was nil.
+	// Stdout holds the captured standard output.
+	// ExecCommand only populates this field when ExecCommandOptions.Stdout is nil.
 	Stdout string
 
-	// Stderr contains the captured standard error.
-	// This is only populated if ExecCommandOptions.Stderr was nil.
+	// Stderr holds the captured standard error.
+	// ExecCommand only populates this field when ExecCommandOptions.Stderr is nil.
 	Stderr string
 
-	// ExitCode is the exit status returned by the command.
+	// ExitCode is the exit status that the process returned.
 	ExitCode int
 }
 
-// ExecCommandOptions holds the options for running a command in the sandbox.
+// ExecCommandOptions specifies the execution settings for a sandbox command.
 type ExecCommandOptions struct {
-
-	// Command is the process name and arguments to run (e.g. []string{"sh", "-c", "uname -a"}).
+	// Command contains the executable name and its arguments, such as []string{"sh", "-c", "uname -a"}.
 	Command []string
 
-	// Stdin is an optional reader to pipe into the command's standard input.
+	// Stdin provides input to the standard input stream of the command.
 	Stdin io.Reader
 
-	// Stdout is an optional writer where standard output will be written.
-	// If nil, Stdout will be captured internally and returned as a string in the ExecCommandResult.
+	// Stdout receives the standard output stream of the command.
+	// When Stdout is nil, ExecCommand captures the output and returns it in the result.
 	Stdout io.Writer
 
-	// Stderr is an optional writer where standard error will be written.
-	// If nil, Stderr will be captured internally and returned as a string in the ExecCommandResult.
+	// Stderr receives the standard error stream of the command.
+	// When Stderr is nil, ExecCommand captures the error output and returns it in the result.
 	Stderr io.Writer
 
-	// Stream, if true, forces streamed execution over ProcessService.Start even when
-	// Stdin, Stdout, and Stderr are nil.
+	// Stream forces streamed execution using the underlying process service even when all stream fields are nil.
 	Stream bool
 }

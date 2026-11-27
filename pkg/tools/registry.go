@@ -27,23 +27,24 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 )
 
-// Registry keeps track of available tools and handles their invocations.
+// Registry manages a collection of tools and routes invocations to them.
 type Registry struct {
 	tools map[string]Tool
 
-	// ToolTimeout bounds how long a single tool invocation (Tool.Run) may run.
-	// A value <= 0 disables the timeout, preserving unbounded execution.
+	// ToolTimeout specifies the maximum duration that a single tool invocation can run.
+	// A duration less than or equal to zero disables the timeout.
 	ToolTimeout time.Duration
 }
 
-// NewRegistry initializes a new tool registry.
+// NewRegistry creates and returns an empty tool registry.
 func NewRegistry() *Registry {
 	return &Registry{
 		tools: make(map[string]Tool),
 	}
 }
 
-// Add registers a new tool.
+// Add registers a tool with the registry.
+// The registry panics if the tool is nil or if it is not a pointer.
 func (r *Registry) Add(tool Tool) {
 	if tool == nil {
 		panic("registered tool must not be nil")
@@ -56,7 +57,7 @@ func (r *Registry) Add(tool Tool) {
 	r.tools[name] = tool
 }
 
-// All returns schemas for all registered tools.
+// All returns a sorted list of schemas for all registered tools.
 func (r *Registry) All() []llm.Tool {
 	var list []llm.Tool
 	for _, tool := range r.tools {
@@ -86,7 +87,7 @@ func (r *Registry) All() []llm.Tool {
 // context.DeadlineExceeded in the returned error (see Call).
 var errToolTimeout = errors.New("tool execution timeout")
 
-// Call executes a tool call inside the provided sandbox and returns the LLM tool response message.
+// Call executes the specified tool call inside the provided sandbox and returns the LLM tool response message.
 func (r *Registry) Call(ctx context.Context, sandbox Sandbox, tc llm.ToolCall) (llm.Message, error) {
 	log := scoped.Log(ctx)
 

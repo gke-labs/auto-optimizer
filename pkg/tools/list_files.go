@@ -22,12 +22,15 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 )
 
-// ListFilesTool is a tool that lists files in the sandbox.
-// OpenClaw uses "ls" defined at https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/ls.ts
+// ListFilesTool lists files and directories inside the sandbox.
+// This tool implements the [Tool] interface. It wraps the standard 'ls' command.
 type ListFilesTool struct {
+	// Path specifies the directory to list.
+	// If empty, the tool lists the current directory.
 	Path string `json:"path"`
 }
 
+// Schema returns the JSON schema that describes the file listing tool to the LLM.
 func (t *ListFilesTool) Schema() llm.Tool {
 	return llm.Tool{
 		Type: "function",
@@ -47,6 +50,7 @@ func (t *ListFilesTool) Schema() llm.Tool {
 	}
 }
 
+// Run executes the file listing command in the sandbox and returns the list of files.
 func (t *ListFilesTool) Run(ctx context.Context, sandbox Sandbox) (llm.Message, error) {
 	log := scoped.Log(ctx)
 

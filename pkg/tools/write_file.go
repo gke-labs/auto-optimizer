@@ -24,13 +24,17 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 )
 
-// WriteFileTool is a tool that writes content to a file in the sandbox.
-// OpenClaw uses "write" defined at https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/write.ts
+// WriteFileTool writes content to a file inside the sandbox.
+// This tool implements the [Tool] interface. It automatically creates any missing parent directories.
 type WriteFileTool struct {
-	Path    string `json:"path"`
+	// Path specifies the path of the file to write.
+	Path string `json:"path"`
+
+	// Content contains the data to write to the file.
 	Content string `json:"content"`
 }
 
+// Schema returns the JSON schema that describes the file writing tool to the LLM.
 func (t *WriteFileTool) Schema() llm.Tool {
 	return llm.Tool{
 		Type: "function",
@@ -55,6 +59,7 @@ func (t *WriteFileTool) Schema() llm.Tool {
 	}
 }
 
+// Run writes the specified content to the file in the sandbox and returns a success message.
 func (t *WriteFileTool) Run(ctx context.Context, sandbox Sandbox) (llm.Message, error) {
 	log := scoped.Log(ctx)
 
