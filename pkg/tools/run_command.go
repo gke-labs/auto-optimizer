@@ -22,11 +22,14 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 )
 
-// RunCommand is a tool that runs shell commands in the sandbox.
+// RunCommand executes shell commands inside the sandbox.
+// This tool implements the [Tool] interface. It runs commands inside a 'sh' shell.
 type RunCommand struct {
+	// Command contains the shell command string to run.
 	Command string `json:"command"`
 }
 
+// Schema returns the JSON schema that describes the command execution tool to the LLM.
 func (t *RunCommand) Schema() llm.Tool {
 	return llm.Tool{
 		Type: "function",
@@ -47,6 +50,7 @@ func (t *RunCommand) Schema() llm.Tool {
 	}
 }
 
+// Run executes the command in the sandbox and returns its standard output, standard error, and exit code.
 func (t *RunCommand) Run(ctx context.Context, sandbox Sandbox) (llm.Message, error) {
 	log := scoped.Log(ctx)
 

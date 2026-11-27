@@ -23,11 +23,14 @@ import (
 	"github.com/gke-labs/auto-optimizer/pkg/scoped"
 )
 
-// ReadFileTool is a tool that reads file contents from the sandbox.
+// ReadFileTool reads the contents of a specified file from the sandbox.
+// This tool implements the [Tool] interface. It wraps the standard 'cat' command.
 type ReadFileTool struct {
+	// Path specifies the location of the file to read.
 	Path string `json:"path"`
 }
 
+// Schema returns the JSON schema that describes the file reading tool to the LLM.
 func (t *ReadFileTool) Schema() llm.Tool {
 	// Area of future investigation: do the models favor certain names (e.g. antigravity uses view_file)
 	return llm.Tool{
@@ -49,6 +52,7 @@ func (t *ReadFileTool) Schema() llm.Tool {
 	}
 }
 
+// Run reads the file in the sandbox and returns its contents.
 func (t *ReadFileTool) Run(ctx context.Context, sandbox Sandbox) (llm.Message, error) {
 	log := scoped.Log(ctx)
 
